@@ -1,3 +1,5 @@
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -23,6 +25,36 @@ class _ConstantDensityModel:
 
 
 class InfrastructureTests(unittest.TestCase):
+    def test_repository_local_package_imports(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        result = subprocess.run(
+            [
+                sys.executable,
+                '-c',
+                (
+                    'from pathlib import Path; '
+                    'import datasets, models, utils; '
+                    'from datasets.carpk import CARPK; '
+                    'from datasets.dataset import ObjectCount; '
+                    'from models.build import build_t2icount; '
+                    'from utils.paths import AssetPaths; '
+                    'root = Path.cwd().resolve(); '
+                    'assert Path(datasets.__file__).resolve() == '
+                    'root / "datasets" / "__init__.py"; '
+                    'assert Path(models.__file__).resolve() == '
+                    'root / "models" / "__init__.py"; '
+                    'assert Path(utils.__file__).resolve() == '
+                    'root / "utils" / "__init__.py"; '
+                    'print(datasets.__file__)'
+                ),
+            ],
+            cwd=str(repo_root),
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(str(repo_root / 'datasets' / '__init__.py'), result.stdout)
+
     def test_asset_layout(self):
         root = Path('external-assets').absolute()
         paths = AssetPaths(root)
