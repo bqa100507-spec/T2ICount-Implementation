@@ -1,11 +1,18 @@
 import argparse
 import torch
-import os
 from utils.regression_trainer import Reg_Trainer
+from utils.paths import (
+    AssetPaths,
+    require_file,
+    resolve_required_directory,
+    resolve_required_file,
+)
 
 
 def parse_arg():
     parser = argparse.ArgumentParser()
+    parser.add_argument('--asset-root', default=None,
+                        help='External asset root; overrides T2ICOUNT_ASSET_ROOT.')
     parser.add_argument('--content', default="test", type=str,
                         help='what is it?')
     parser.add_argument('--seed', default=-1, type=int, help='if not using seed, please set as -1')
@@ -15,15 +22,17 @@ def parse_arg():
                         help='the concat size of the training data')
     parser.add_argument('--downsample-ratio', default=8, type=int,
                         help='the downsample ratio of the model')
-    parser.add_argument('--data-dir', default='data/FSC',
-                        help='the directory of the data')
+    parser.add_argument('--data-dir', default=None,
+                        help='FSC-147 directory; defaults under the asset root')
     parser.add_argument('--config', default='configs/v1-inference.yaml',
                         help='the config of the ldm model')
-    parser.add_argument('--sd-path', default='configs/v1-5-pruned-emaonly.ckpt',
-                        help='the path of the pretrained stable diffusion model')
+    parser.add_argument('--sd-path', default=None,
+                        help='local Stable Diffusion checkpoint; defaults under the asset root')
+    parser.add_argument('--clip-path', default=None,
+                        help='local CLIP directory; defaults under the asset root')
 
-    parser.add_argument('--save-dir', default='history',
-                        help='the directory for saving models and training logs')
+    parser.add_argument('--save-dir', default=None,
+                        help='directory for checkpoints/logs; defaults under the asset root')
 
     parser.add_argument('--max-num', default=2, type=int,
                         help='the maximum number of saved models ')
@@ -57,8 +66,33 @@ def parse_arg():
     return args
 
 
+def resolve_training_paths(args):
+    assets = AssetPaths.from_sources(args.asset_root, required=False)
+    args.config = str(require_file(args.config, 'Stable Diffusion config'))
+    args.sd_path = str(resolve_required_file(
+        args.sd_path, assets.sd_checkpoint if assets else None,
+        'Stable Diffusion checkpoint'
+    ))
+    args.clip_path = str(resolve_required_directory(
+        args.clip_path, assets.clip_dir if assets else None, 'CLIP model'
+    ))
+    args.data_dir = str(resolve_required_directory(
+        args.data_dir, assets.dataset_dir('fsc147') if assets else None,
+        'FSC147 dataset'
+    ))
+    if args.save_dir is None:
+        if assets is None:
+            raise ValueError(
+                '--save-dir is required when T2ICOUNT_ASSET_ROOT is not configured.'
+            )
+        args.save_dir = str(assets.baseline_checkpoint_dir)
+    if args.resume:
+        args.resume = str(require_file(args.resume, 'resume checkpoint'))
+    return args
+
+
 if __name__ == '__main__':
-    args = parse_arg()
+    args = resolve_training_paths(parse_arg())
     torch.backends.cudnn.benchmark = True
     trainer = Reg_Trainer(args)
     trainer.setup()

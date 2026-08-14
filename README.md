@@ -4,9 +4,100 @@
 Official Implementation for CVPR 2025 paper T2ICount: Enhancing Cross-modal Understanding for Zero-Shot Counting.
 ![teaser](asset/teaser.jpg)
 
-## Preparation
+## Portable offline setup
 
-**Environment:** Create a virtural environment use Anaconda, and install all dependencies.
+Clone this implementation repository:
+
+```bash
+git clone https://github.com/bqa100507-spec/T2ICount-Implementation.git
+cd T2ICount-Implementation
+```
+
+Code and small configuration files live in this repository. Models, datasets,
+checkpoints, and generated outputs live in one external directory:
+
+```text
+T2ICount-assets/
+|-- pretrained/
+|   |-- clip-vit-large-patch14/
+|   `-- sd-v1-5/v1-5-pruned-emaonly.ckpt
+|-- datasets/
+|   |-- FSC147/
+|   |-- CARPK/
+|   `-- IDCIA/
+|-- checkpoints/
+|   |-- official/best_model_paper.pth
+|   |-- baseline_retrain/
+|   `-- dumlo/
+`-- outputs/
+```
+
+`FSC147/` retains `images_384_VarV2/`,
+`gt_density_map_adaptive_384_VarV2/`, and `FSC_147/`. `CARPK/` retains
+`Images/`, `Annotations/`, and `ImageSets/`. IDCIA retains `images/`,
+`ground_truth/`, and the official `test.csv`.
+
+### Windows PowerShell
+
+```powershell
+& "C:\Users\MSl\miniconda3\shell\condabin\conda-hook.ps1"
+conda activate t2itest
+Remove-Item Env:SSLKEYLOGFILE -ErrorAction SilentlyContinue
+$env:T2ICOUNT_ASSET_ROOT = "D:\T2ICount-assets"
+$env:HF_HUB_OFFLINE = "1"
+$env:TRANSFORMERS_OFFLINE = "1"
+python scripts/check_assets.py --asset-root "D:\T2ICount-assets" --data fsc147 --check-offline-load
+python test.py --asset-root "D:\T2ICount-assets" --data fsc147 --batch-size 1 --max-samples 1
+```
+
+The historical environment remains pinned in `environment.yaml` because the
+official SD/T2ICount checkpoint path is sensitive to framework changes. See
+`docs/dependency_audit.md` before upgrading it.
+
+### Colab with Google Drive
+
+Open `notebooks/train_colab.ipynb`. It mounts Drive, clones/opens this repo,
+installs dependencies, sets
+`T2ICOUNT_ASSET_ROOT=/content/drive/MyDrive/T2ICount-assets`, validates assets,
+and runs a one-image smoke test. It also documents the separate environment
+exports required by a VSCode terminal connected to the Colab runtime. The
+notebook contains orchestration only and does not start full training
+automatically.
+
+Long-running Colab runs should use an explicit Drive save directory, such as
+`/content/drive/MyDrive/T2ICount-assets/checkpoints/baseline_retrain/run_01`,
+because `/content` is temporary. New `.tar` checkpoints contain model weights,
+optimizer state, the next epoch, best validation metrics, and RNG state. This
+project has no LR scheduler or AMP scaler, so there is no scheduler/scaler state
+to restore. Legacy `.tar` checkpoints remain loadable; `.pth` files are
+weights-only and are not accepted by `--resume`.
+
+IDCIA result analysis and density-map visualization are in
+`notebooks/visualize_results.ipynb`; this notebook uses the same external asset,
+model-building, and inference APIs as `test.py`.
+
+### Explicit paths without the environment variable
+
+```powershell
+python test.py --data fsc147 `
+  --dataset-root "D:\T2ICount-assets\datasets\FSC147" `
+  --clip-path "D:\T2ICount-assets\pretrained\clip-vit-large-patch14" `
+  --sd-path "D:\T2ICount-assets\pretrained\sd-v1-5\v1-5-pruned-emaonly.ckpt" `
+  --model-path "D:\T2ICount-assets\checkpoints\official\best_model_paper.pth" `
+  --batch-size 16
+```
+
+Every Hugging Face load in the active T2ICount path is local-only. Missing
+assets fail with the exact missing path instead of falling back to the Hub. See
+`docs/offline_asset_audit.md` for the loader audit.
+
+Heavy datasets, model weights, checkpoints, logs, and generated outputs are
+intentionally excluded from Git. The small original `asset/` directory remains
+part of the repository.
+
+## Original dataset and model references
+
+The original environment can be created with Anaconda:
 ```
 conda env create -f environment.yaml
 ```
@@ -14,7 +105,8 @@ conda env create -f environment.yaml
 The three dataset could be downloaded at: [FSC-147](https://github.com/cvlab-stonybrook/LearningToCountEverything) | [CARPK](https://lafi.github.io/LPN/).
 Notice that you have to download the annoations of FSC-147 separately from [their repo](https://github.com/cvlab-stonybrook/LearningToCountEverything/tree/master/data).
 
-Extract and put the downloaded data in the `data/` dir. The complete file structure should look like this. You don't have to download all the dataset for evaluation, but you must have FSC-147 if you want to train the model. 
+Keep the downloaded dataset structure below, but place it under the external
+`datasets/` directory described above. FSC-147 is required for training.
 ```
 data
 ├─CARPK/
@@ -31,7 +123,7 @@ data
 │  │  ├─ annotation_FSC147_384.json
 ```
 **Stable Diffusion:** Our model is developed by fine-tuning Stable Diffusion v1.5, whose original weights can be downloaded from [here](https://huggingface.co/stable-diffusion-v1-5/stable-diffusion-v1-5/blob/main/v1-5-pruned-emaonly.ckpt).
-Please put the downloaded weight file in the `configs/` dir.
+Store this checkpoint under external `pretrained/sd-v1-5/`, not in `configs/`.
 
 ## FSC-147-S-v2
 During the review process, the reviewers raised concerns regarding the dataset. In response, we conducted a thorough reassessment and introduced a revised version, which we named FSC-147-S-v2. This updated version includes an additional set of images, bringing the total to 230. As a result, the statistics of v2 differ from those originally reported in the paper. In this new subset, the objects originally annotated in these images from FSC-147 had an average count of 44.98, while the newly annotated objects have an average count of 3.96. The results from the baseline methods and our method are provided here. For the updated dataset (v2), please refer to [**FSC-147-S.json**](https://github.com/cha15yq/T2ICount/blob/main/FSC-147-S.json). As for the original subset used in the paper, you can download it [here](https://github.com/cha15yq/T2ICount/blob/main/asset/FSC-147-S-v1.json). We sincerely apologize for any confusion caused.
@@ -53,7 +145,7 @@ Once you have prepared the data and the pretrained weights of SD1.5, you can tra
 
 We have tested the reproducibility of this code and obtained consistent results, the [training log](https://github.com/cha15yq/T2ICount/blob/main/logs/train.log) is provided along with the [reproduced model](https://drive.google.com/file/d/1VN5uI9F0XjKQ-JwjOpMYYJF5ku92znO_/view?usp=sharing).
 ```
-CUDA_VISIBLE_DEVICES=0 python train.py --content exp --crop-size 384 --concat-size 224 --data-dir data/FSC --batch-size 16 --lr 5e-5 --weight-decay 5e-5
+python train.py --content exp --crop-size 384 --concat-size 224 --batch-size 16 --lr 5e-5 --weight-decay 5e-5
 ```
 ---
 ## Evaluation and the pretrained model
@@ -67,7 +159,7 @@ We provide a [pre-trained ckpt](https://drive.google.com/file/d/1lw5LgpYP7vTazaM
 |--------------|--------------|
 | 5.99       | 10.55        |
 ```
-CUDA_VISIBLE_DEVICES=0 python test.py --model-path ./best_model_paper.pth --data fsc147(or carpk) --batch-size 16 --dataset_type FSC --ckpt path/to/model.ckpt
+python test.py --data fsc147 --batch-size 16
 ```
 ---
 ## Gallery

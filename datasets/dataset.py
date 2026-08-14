@@ -6,11 +6,15 @@ import numpy as np
 import h5py
 import torchvision.transforms.functional as F
 import random
-from PIL import Image
+from PIL import Image, ImageOps
 from torchvision import transforms
 import cv2
 import json
-from transformers import CLIPTokenizer
+import csv
+import math
+from pathlib import Path
+
+from utils.clip import load_clip_tokenizer
 
 
 def random_crop(im_h, im_w, crop_h, crop_w):
@@ -22,7 +26,8 @@ def random_crop(im_h, im_w, crop_h, crop_w):
 
 
 class ObjectCount(Dataset):
-    def __init__(self, root, crop_size, downsample_ratio, method='train', concat_size=224):
+    def __init__(self, root, crop_size, downsample_ratio, method='train', concat_size=224,
+                 tokenizer=None, clip_path=None):
         super(ObjectCount, self).__init__()
         #self.im_list = sorted(glob(os.path.join(root, 'images/*.jpg')))
         assert crop_size % downsample_ratio == 0
@@ -34,7 +39,9 @@ class ObjectCount(Dataset):
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
         ])
-        self.tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-large-patch14")
+        if tokenizer is None and clip_path is None:
+            raise ValueError("ObjectCount requires tokenizer or an explicit local clip_path.")
+        self.tokenizer = tokenizer or load_clip_tokenizer(clip_path)
         self.concat_size = concat_size
 
         with open(os.path.join(root, 'FSC_147/Train_Test_Val_FSC_147.json'), 'r') as f:
@@ -167,5 +174,122 @@ class ObjectCount(Dataset):
             img_attention_map = np.fliplr(img_attention_map)
 
         return self.transform(img), torch.from_numpy(den_map.copy()).float().unsqueeze(0), torch.from_numpy(img_attention_map.copy()).float().unsqueeze(0)
+
+
+class IDCIA(Dataset):
+    STAININGS = ('DAPI', 'TuJ1', 'MAP2ab', 'RIP', 'GFAP', 'Nestin', 'Ki67')
+
+    def __init__(self, root, split='test', preprocess='raw'):
+        if split != 'test':
+            raise ValueError("IDCIA zero-shot evaluation only supports the official test split.")
+
+        if preprocess not in ('raw', 'autocontrast'):
+            raise ValueError(
+                "IDCIA preprocess must be 'raw' or 'autocontrast'."
+            )
+
+        self.root = Path(root)
+        self.preprocess = preprocess
+        self.transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+        ])
+
+        image_index = self._index_files(self.root / 'images', {'.tif', '.tiff', '.png', '.jpg', '.jpeg'})
+        annotation_index = self._index_files(self.root / 'ground_truth', {'.csv'})
+        staining_names = {name.casefold(): name for name in self.STAININGS}
+
+        self.samples = []
+        for image_name in self._read_split(self.root / 'test.csv'):
+            image_key = image_name.casefold()
+            annotation_key = (Path(image_name).stem + '.csv').casefold()
+            if image_key not in image_index:
+                raise FileNotFoundError("IDCIA test image not found: {}".format(image_name))
+            if annotation_key not in annotation_index:
+                raise FileNotFoundError("IDCIA annotation not found for: {}".format(image_name))
+
+            image_path = image_index[image_key]
+            staining_key = image_path.parent.name.casefold()
+            if staining_key not in staining_names:
+                raise ValueError("Unknown IDCIA staining directory: {}".format(image_path.parent.name))
+
+            annotation_path = annotation_index[annotation_key]
+            self.samples.append({
+                'image_path': image_path,
+                'image_name': image_path.name,
+                'staining': staining_names[staining_key],
+                'gt_count': self._count_valid_coordinates(annotation_path),
+            })
+
+        if not self.samples:
+            raise ValueError("IDCIA test split is empty: {}".format(self.root / 'test.csv'))
+
+    @staticmethod
+    def _index_files(directory, extensions):
+        if not directory.is_dir():
+            raise FileNotFoundError("IDCIA directory not found: {}".format(directory))
+
+        index = {}
+        for path in directory.rglob('*'):
+            if not path.is_file() or path.suffix.casefold() not in extensions:
+                continue
+            key = path.name.casefold()
+            if key in index:
+                raise ValueError("Duplicate IDCIA filename: {}".format(path.name))
+            index[key] = path
+        return index
+
+    @staticmethod
+    def _read_split(split_path):
+        if not split_path.is_file():
+            raise FileNotFoundError("IDCIA split file not found: {}".format(split_path))
+
+        image_names = []
+        with split_path.open('r', newline='', encoding='utf-8-sig') as split_file:
+            for row in csv.reader(split_file):
+                if row and row[0].strip():
+                    image_names.append(row[0].strip())
+        return image_names
+
+    @staticmethod
+    def _count_valid_coordinates(annotation_path):
+        count = 0
+        with annotation_path.open('r', newline='', encoding='utf-8-sig') as annotation_file:
+            reader = csv.DictReader(annotation_file)
+            fields = {field.casefold(): field for field in (reader.fieldnames or [])}
+            if 'x' not in fields or 'y' not in fields:
+                raise ValueError("IDCIA annotation must contain X,Y columns: {}".format(annotation_path))
+
+            for row in reader:
+                try:
+                    x = float(row[fields['x']])
+                    y = float(row[fields['y']])
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(x) and math.isfinite(y):
+                    count += 1
+        return count
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, item):
+        sample = self.samples[item]
+
+        with Image.open(sample['image_path']) as image:
+            if self.preprocess == 'autocontrast':
+                # IDCIA images are grayscale.
+                # Apply contrast stretching before converting to RGB.
+                image = image.convert('L')
+                image = ImageOps.autocontrast(image)
+
+            image = image.convert('RGB')
+
+        return (
+            self.transform(image),
+            sample['gt_count'],
+            sample['image_name'],
+            sample['staining'],
+        )
 
 

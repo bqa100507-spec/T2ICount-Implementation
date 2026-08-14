@@ -1,0 +1,42 @@
+# Python and notebook caches
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+/.asset-test/
+
+# Environments and editor-local settings
+.venv/
+venv/
+.conda/
+.vscode/
+
+# External model assets and checkpoints
+*.ckpt
+*.pth
+*.pt
+*.bin
+*.safetensors
+/pretrained/
+/checkpoints/
+/openai/
+
+# External datasets and vendored dependency checkouts
+/data/
+/src/
+
+# Generated training/evaluation artifacts
+/outputs/
+/history/
+/logs/
+lightning_logs/
+wandb/
+*.log
+*.tmp
+
+# OS metadata
+.DS_Store
+Thumbs.db

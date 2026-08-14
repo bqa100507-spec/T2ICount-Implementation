@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 from functools import partial
+import os
 import clip
 from einops import rearrange, repeat
 from transformers import CLIPTokenizer, CLIPTextModel
@@ -136,10 +137,18 @@ class SpatialRescaler(nn.Module):
 
 class FrozenCLIPEmbedder(AbstractEncoder):
     """Uses the CLIP transformer encoder for text (from Hugging Face)"""
-    def __init__(self, version="openai/clip-vit-large-patch14", device="cuda", max_length=77):
+    def __init__(self, version=None, device="cuda", max_length=77):
         super().__init__()
-        self.tokenizer = CLIPTokenizer.from_pretrained(version)
-        self.transformer = CLIPTextModel.from_pretrained(version)
+        if version is None:
+            raise FileNotFoundError(
+                "FrozenCLIPEmbedder requires an explicit local CLIP directory. "
+                "Construct T2ICount through models.build.build_t2icount."
+            )
+        version = os.path.abspath(os.path.expanduser(os.fspath(version)))
+        if not os.path.isdir(version):
+            raise FileNotFoundError("Missing local CLIP directory:\n{}".format(version))
+        self.tokenizer = CLIPTokenizer.from_pretrained(version, local_files_only=True)
+        self.transformer = CLIPTextModel.from_pretrained(version, local_files_only=True)
         self.device = device
         self.max_length = max_length
         self.freeze()

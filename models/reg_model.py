@@ -24,12 +24,13 @@ def load_model_from_config(config, ckpt, verbose=False):
 
 
 class Count(nn.Module):
-    def __init__(self, config, sd_path, unet_config=dict()):
+    def __init__(self, config, sd_path, unet_config=None):
         super(Count, self).__init__()
-        config = OmegaConf.load(f'{config}')
+        if not OmegaConf.is_config(config):
+            config = OmegaConf.load(str(config))
         sd_model = load_model_from_config(config, f"{sd_path}")
         self.vae = sd_model.first_stage_model
-        self.unet = UNetWrapper(sd_model.model, **unet_config)
+        self.unet = UNetWrapper(sd_model.model, **(unet_config or {}))
 
         self.clip = sd_model.cond_stage_model
         del self.vae.decoder

@@ -4,12 +4,13 @@ from torch.utils.data import Dataset
 import os
 from torchvision import transforms
 from PIL import Image
-from transformers import CLIPTokenizer
 import torch
+
+from utils.clip import load_clip_tokenizer
 
 
 class CARPK(Dataset):
-    def __init__(self, root, info):
+    def __init__(self, root, info, tokenizer=None, clip_path=None):
         self.im_list = sorted(glob.glob(os.path.join(root, 'Images/*.png')))
                 
         self.root = root
@@ -31,7 +32,9 @@ class CARPK(Dataset):
             if os.path.basename(i).replace('.png', '') in self.label_list:
                 split_list.append(i)
         self.im_list = split_list
-        self.tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-large-patch14")
+        if tokenizer is None and clip_path is None:
+            raise ValueError("CARPK requires tokenizer or an explicit local clip_path.")
+        self.tokenizer = tokenizer or load_clip_tokenizer(clip_path)
 
     def __len__(self):
         return len(self.im_list)

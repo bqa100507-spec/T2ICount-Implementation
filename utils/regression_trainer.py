@@ -3,7 +3,7 @@ import torch
 import logging
 from utils.helper import SaveHandler, AverageMeter
 from utils.trainer import Trainer
-from models.reg_model import Count
+from models.build import build_t2icount
 from datasets.dataset import ObjectCount
 import numpy as np
 import os
@@ -12,7 +12,7 @@ import random
 import torch.nn.functional as F
 import torch.nn as nn
 from utils.ssim_loss import cal_avg_ms_ssim
-from utils.tools import extract_patches, reassemble_patches
+from utils.inference import predict_count
 
 
 def setup_seed(seed):
@@ -21,6 +21,48 @@ def setup_seed(seed):
     np.random.seed(seed)
     random.seed(seed)
     torch.backends.cudnn.deterministic = True
+
+
+def _capture_rng_state():
+    state = {
+        'python': random.getstate(),
+        'numpy': np.random.get_state(),
+        'torch': torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state['cuda'] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def _restore_rng_state(state):
+    if not state:
+        return
+    if 'python' in state:
+        random.setstate(state['python'])
+    if 'numpy' in state:
+        np.random.set_state(state['numpy'])
+    if 'torch' in state:
+        torch.set_rng_state(state['torch'])
+    if 'cuda' in state and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(state['cuda'])
+
+
+def _atomic_torch_save(payload, path):
+    temporary_path = '{}.tmp'.format(path)
+    try:
+        torch.save(payload, temporary_path)
+        os.replace(temporary_path, path)
+    finally:
+        if os.path.exists(temporary_path):
+            os.remove(temporary_path)
+
+
+def _load_torch_checkpoint(path, device):
+    try:
+        return torch.load(path, map_location=device, weights_only=False)
+    except TypeError:
+        # PyTorch 1.11 does not expose the weights_only argument.
+        return torch.load(path, map_location=device)
 
 
 def train_collate(batch):
@@ -50,11 +92,26 @@ class Reg_Trainer(Trainer):
 
         self.d_ratio = args.downsample_ratio
 
+        self.model = build_t2icount(
+            args.config,
+            args.sd_path,
+            args.clip_path,
+            device=self.device,
+            mode='train',
+            unet_config={
+                'base_size': self.args.crop_size,
+                'max_attn_size': self.args.crop_size // self.d_ratio,
+                'attn_selector': 'down_cross+up_cross',
+            },
+        )
+
         self.datasets = {x: ObjectCount(args.data_dir,
                                         crop_size=args.crop_size,
                                         downsample_ratio=self.d_ratio,
                                         method=x,
-                                        concat_size=args.concat_size) for x in ['train', 'val', 'test']}
+                                        concat_size=args.concat_size,
+                                        tokenizer=self.model.clip.tokenizer)
+                         for x in ['train', 'val', 'test']}
 
         self.dataloaders = {x: DataLoader(self.datasets[x],
                                           batch_size=(args.batch_size
@@ -64,14 +121,6 @@ class Reg_Trainer(Trainer):
                                           num_workers=args.num_workers * self.device_count,
                                           pin_memory=(True if x == 'train' else False))
                             for x in ['train', 'val', 'test']}
-
-
-        self.model = Count(args.config, args.sd_path,
-                           unet_config={'base_size': self.args.crop_size,
-                                        'max_attn_size': self.args.crop_size // self.d_ratio,
-                                        'attn_selector': 'down_cross+up_cross'})
-        self.model.to(self.device)
-
         self.optimizer = torch.optim.AdamW([
             {'params': self.model.unet.parameters(),
              'lr': args.lr * 0.1,
@@ -80,21 +129,52 @@ class Reg_Trainer(Trainer):
              'lr': args.lr,
              'weight_decay': args.weight_decay}])
 
-        self.start_epoch = 0
+        self.start_epoch = args.start_epoch
+        self.best_mae = np.inf
+        self.best_mse = np.inf
+        self.save_list = SaveHandler(num=args.max_num)
 
         if args.resume:
             suf = args.resume.rsplit('.', 1)[-1]
             if suf == 'tar':
-                checkpoint = torch.load(args.resume, self.device)
-                self.model.load_state_dict(checkpoint['model_state_dict'])
-                self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-                self.start_epoch = checkpoint['epoch'] + 1
+                self._load_training_checkpoint(args.resume)
             elif suf == 'pth':
-                raise Exception('Not supported')
+                raise ValueError(
+                    'A .pth file contains model weights only and cannot resume '
+                    'optimizer/epoch state. Use a training .tar checkpoint.'
+                )
 
-        self.best_mae = np.inf
-        self.best_mse = np.inf
-        self.save_list = SaveHandler(num=args.max_num)
+    def _load_training_checkpoint(self, path):
+        checkpoint = _load_torch_checkpoint(path, self.device)
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        self.start_epoch = checkpoint.get(
+            'next_epoch', int(checkpoint['epoch']) + 1
+        )
+        self.best_mae = checkpoint.get('best_mae', np.inf)
+        self.best_mse = checkpoint.get('best_mse', np.inf)
+        _restore_rng_state(checkpoint.get('rng_state'))
+        logging.info(
+            'Resumed full training state from %s at epoch %d',
+            path,
+            self.start_epoch,
+        )
+
+    def _save_training_checkpoint(self):
+        save_path = os.path.join(
+            self.save_dir, '{}_ckpt.tar'.format(self.epoch)
+        )
+        _atomic_torch_save({
+            'format_version': 2,
+            'epoch': self.epoch,
+            'next_epoch': self.epoch + 1,
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'model_state_dict': self.model.state_dict(),
+            'best_mae': self.best_mae,
+            'best_mse': self.best_mse,
+            'rng_state': _capture_rng_state(),
+        }, save_path)
+        self.save_list.append(save_path)
 
     def train(self):
         args = self.args
@@ -104,6 +184,8 @@ class Reg_Trainer(Trainer):
             self.train_epoch()
             if self.epoch >= args.start_val and self.epoch % self.args.val_epoch == 0:
                 self.val_epoch()
+            if self.epoch % 5 == 0:
+                self._save_training_checkpoint()
 
     def train_epoch(self):
         epoch_reg_loss = AverageMeter()
@@ -150,41 +232,9 @@ class Reg_Trainer(Trainer):
             .format(self.epoch, epoch_reg_loss.getAvg(), epoch_RRC1_loss.getAvg(), epoch_RRC2_loss.getAvg(), epoch_mae.getAvg(),
                     np.sqrt(epoch_mse.getAvg()), (time.time() - epoch_start)))
 
-        if self.epoch % 5 == 0:
-            model_state_dict = self.model.state_dict()
-            save_path = os.path.join(self.save_dir, "{}_ckpt.tar".format(self.epoch))
-            torch.save({
-                'epoch': self.epoch,
-                'optimizer_state_dict': self.optimizer.state_dict(),
-                'model_state_dict': model_state_dict,
-            }, save_path)
-            self.save_list.append(save_path)
-
     def val_epoch(self):
         epoch_start = time.time()
-        self.model.set_eval()
-        epoch_res = []
-        for inputs, gt_counts, captions, prompt_attn_mask, name in self.dataloaders['val']:
-            inputs = inputs.to(self.device)
-            gt_attn_mask = prompt_attn_mask.to(self.device).unsqueeze(2).unsqueeze(3)
-            cropped_imgs, num_h, num_w = extract_patches(inputs, patch_size=self.args.crop_size,
-                                                         stride=self.args.stride)
-            outputs = []
-            with torch.set_grad_enabled(False):
-                num_chunks = (cropped_imgs.size(0) + self.args.batch_size - 1) // self.args.batch_size
-                for i in range(num_chunks):
-                    start_idx = i * self.args.batch_size
-                    end_idx = min((i + 1) * self.args.batch_size, cropped_imgs.size(0))
-                    outputs_partial = self.model(cropped_imgs[start_idx:end_idx], captions * (end_idx - start_idx), gt_attn_mask.repeat((end_idx - start_idx), 1, 1, 1))[0]
-                    outputs.append(outputs_partial)
-                results = reassemble_patches(torch.cat(outputs, dim=0), num_h, num_w, inputs.size(2), inputs.size(3),
-                                             patch_size=self.args.crop_size, stride=self.args.stride)
-                res = gt_counts[0].item() - torch.sum(results).item() / 60
-                epoch_res.append(res)
-
-        epoch_res = np.array(epoch_res)
-        mse = np.sqrt(np.mean(np.square(epoch_res)))
-        mae = np.mean(np.abs(epoch_res))
+        mae, mse = self._evaluate_split('val')
 
         logging.info('Epoch {} Val, MAE: {:.2f}, MSE: {:.2f} Cost {:.1f} sec'
                      .format(self.epoch, mae, mse, (time.time() - epoch_start)))
@@ -194,39 +244,41 @@ class Reg_Trainer(Trainer):
         if (mae + mse) < (self.best_mae + self.best_mse):
             self.best_mae = mae
             self.best_mse = mse
-            torch.save(model_state_dict, os.path.join(self.save_dir, 'best_model_{}.pth'.format(self.epoch)))
+            _atomic_torch_save(
+                model_state_dict,
+                os.path.join(self.save_dir, 'best_model_{}.pth'.format(self.epoch)),
+            )
             logging.info("Save best model: MAE: {:.2f} MSE:{:.2f} model epoch {}".format(mae, mse, self.epoch))
             self.test_epoch()
         print("Best Result: MAE: {:.2f} MSE:{:.2f}".format(self.best_mae, self.best_mse))
 
     def test_epoch(self):
         epoch_start = time.time()
+        mae, mse = self._evaluate_split('test')
+
+        logging.info('Epoch {} Test, MAE: {:.2f}, MSE: {:.2f} Cost {:.1f} sec'
+                     .format(self.epoch, mae, mse, (time.time() - epoch_start)))
+
+    def _evaluate_split(self, split):
         self.model.set_eval()
         epoch_res = []
-        for inputs, gt_counts, captions, prompt_attn_mask, name in self.dataloaders['test']:
+        for inputs, gt_counts, captions, prompt_attn_mask, name in self.dataloaders[split]:
             inputs = inputs.to(self.device)
-            gt_attn_mask = prompt_attn_mask.to(self.device).unsqueeze(2).unsqueeze(3)
-            cropped_imgs, num_h, num_w = extract_patches(inputs, patch_size=self.args.crop_size,
-                                                         stride=self.args.stride)
-            outputs = []
-            with torch.set_grad_enabled(False):
-                num_chunks = (cropped_imgs.size(0) + self.args.batch_size - 1) // self.args.batch_size
-                for i in range(num_chunks):
-                    start_idx = i * self.args.batch_size
-                    end_idx = min((i + 1) * self.args.batch_size, cropped_imgs.size(0))
-                    outputs_partial = self.model(cropped_imgs[start_idx:end_idx], captions * (end_idx - start_idx), gt_attn_mask.repeat((end_idx - start_idx), 1, 1, 1))[0]
-                    outputs.append(outputs_partial)
-                results = reassemble_patches(torch.cat(outputs, dim=0), num_h, num_w, inputs.size(2), inputs.size(3),
-                                             patch_size=self.args.crop_size, stride=self.args.stride)
-                res = gt_counts[0].item() - torch.sum(results).item() / 60
-                epoch_res.append(res)
+            prediction = predict_count(
+                self.model,
+                inputs,
+                captions[0],
+                prompt_attn_mask,
+                batch_size=self.args.batch_size,
+                patch_size=self.args.crop_size,
+                stride=self.args.stride,
+            )
+            epoch_res.append(gt_counts[0].item() - prediction)
 
         epoch_res = np.array(epoch_res)
         mse = np.sqrt(np.mean(np.square(epoch_res)))
         mae = np.mean(np.abs(epoch_res))
-
-        logging.info('Epoch {} Test, MAE: {:.2f}, MSE: {:.2f} Cost {:.1f} sec'
-                     .format(self.epoch, mae, mse, (time.time() - epoch_start)))
+        return mae, mse
 
 def get_normalized_map(density_map):
     B, C, H, W = density_map.size()
