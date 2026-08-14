@@ -3,9 +3,11 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import torch
 
+from utils.checkpoints import load_trusted_legacy_checkpoint
 from utils.inference import build_prompt_attention_mask, predict_count
 from utils.paths import AssetPathError, AssetPaths, require_directory
 
@@ -25,6 +27,43 @@ class _ConstantDensityModel:
 
 
 class InfrastructureTests(unittest.TestCase):
+    def test_trusted_legacy_checkpoint_disables_weights_only(self):
+        expected = object()
+        with mock.patch(
+            'utils.checkpoints.torch.load', return_value=expected
+        ) as torch_load:
+            result = load_trusted_legacy_checkpoint(
+                'checkpoint.ckpt', map_location='cpu'
+            )
+
+        self.assertIs(result, expected)
+        torch_load.assert_called_once_with(
+            'checkpoint.ckpt', map_location='cpu', weights_only=False
+        )
+
+    def test_trusted_legacy_checkpoint_falls_back_for_old_pytorch(self):
+        expected = object()
+        with mock.patch(
+            'utils.checkpoints.torch.load',
+            side_effect=[TypeError('unsupported argument'), expected],
+        ) as torch_load:
+            result = load_trusted_legacy_checkpoint(
+                'checkpoint.ckpt', map_location='cpu'
+            )
+
+        self.assertIs(result, expected)
+        self.assertEqual(
+            torch_load.call_args_list,
+            [
+                mock.call(
+                    'checkpoint.ckpt',
+                    map_location='cpu',
+                    weights_only=False,
+                ),
+                mock.call('checkpoint.ckpt', map_location='cpu'),
+            ],
+        )
+
     def test_repository_local_package_imports(self):
         repo_root = Path(__file__).resolve().parents[1]
         result = subprocess.run(

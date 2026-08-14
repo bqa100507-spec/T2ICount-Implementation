@@ -5,11 +5,12 @@ import torch
 from models.diff_unet import UNetWrapper
 import torch.nn.functional as F
 from models.decoder import Upsample, Regressor
+from utils.checkpoints import load_trusted_legacy_checkpoint
 
 
 def load_model_from_config(config, ckpt, verbose=False):
     print(f"Loading model from {ckpt}")
-    pl_sd = torch.load(ckpt, map_location="cpu")
+    pl_sd = load_trusted_legacy_checkpoint(ckpt, map_location="cpu")
     sd = pl_sd["state_dict"]
     model = instantiate_from_config(config.model)
     m, u = model.load_state_dict(sd, strict=False)

@@ -4,6 +4,7 @@ import torch
 from omegaconf import OmegaConf
 
 from models.reg_model import Count
+from utils.checkpoints import load_trusted_legacy_checkpoint
 from utils.paths import require_directory, require_file
 
 
@@ -16,7 +17,9 @@ DEFAULT_UNET_CONFIG = {
 
 def load_t2icount_checkpoint(model, checkpoint_path, strict=True):
     checkpoint = require_file(checkpoint_path, "T2ICount checkpoint")
-    state = torch.load(str(checkpoint), map_location="cpu")
+    state = load_trusted_legacy_checkpoint(
+        str(checkpoint), map_location="cpu"
+    )
     if isinstance(state, dict) and "model_state_dict" in state:
         state = state["model_state_dict"]
     model.load_state_dict(state, strict=strict)

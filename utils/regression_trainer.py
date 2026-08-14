@@ -11,6 +11,7 @@ import time
 import random
 import torch.nn.functional as F
 import torch.nn as nn
+from utils.checkpoints import load_trusted_legacy_checkpoint
 from utils.ssim_loss import cal_avg_ms_ssim
 from utils.inference import predict_count
 
@@ -55,14 +56,6 @@ def _atomic_torch_save(payload, path):
     finally:
         if os.path.exists(temporary_path):
             os.remove(temporary_path)
-
-
-def _load_torch_checkpoint(path, device):
-    try:
-        return torch.load(path, map_location=device, weights_only=False)
-    except TypeError:
-        # PyTorch 1.11 does not expose the weights_only argument.
-        return torch.load(path, map_location=device)
 
 
 def train_collate(batch):
@@ -145,7 +138,7 @@ class Reg_Trainer(Trainer):
                 )
 
     def _load_training_checkpoint(self, path):
-        checkpoint = _load_torch_checkpoint(path, self.device)
+        checkpoint = load_trusted_legacy_checkpoint(path, self.device)
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.start_epoch = checkpoint.get(
