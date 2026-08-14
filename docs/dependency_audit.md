@@ -32,3 +32,19 @@ and the Lightning `rank_zero_only` import accepts both old and new locations.
 The Windows checkpoint regression validates only the preserved environment.
 Colab must run the same one-image smoke comparison before its dependency bridge
 is accepted for training; framework-level numerical equivalence is not assumed.
+
+## Source dependency pins
+
+The editable Git dependencies are pinned to the exact commits supplying the
+verified `t2itest` environment rather than moving branches:
+
+- `CompVis/taming-transformers`:
+  `3ba01b241669f5ade541ce990f7650a3b8f65318`;
+- `openai/CLIP`: `d05afc436d78f1c48dc0dbf8e5980a9d471f35f6`.
+
+The imported packages resolve to the ignored local checkouts at
+`src/taming-transformers/taming` and `src/clip/clip`, respectively. Both
+checkouts were clean apart from generated taming cache/metadata files, their
+origins matched the named GitHub repositories, and each SHA was verified
+against the corresponding authoritative repository. The pin changes dependency
+resolution only; no package was upgraded or reinstalled during this audit.
