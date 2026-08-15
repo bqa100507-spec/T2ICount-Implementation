@@ -1,4 +1,4 @@
-from torch.utils.data import DataLoader, default_collate
+from torch.utils.data import DataLoader, Subset, default_collate
 import torch
 import logging
 from utils.helper import SaveHandler, AverageMeter
@@ -68,6 +68,22 @@ def train_collate(batch):
     return images, den, prompt, prompt_attn_mask, img_attn_mask
 
 
+def apply_smoke_train_sample_limit(datasets, sample_limit):
+    if sample_limit > 0:
+        train_dataset = datasets['train']
+        effective_samples = min(sample_limit, len(train_dataset))
+        datasets['train'] = Subset(
+            train_dataset, range(effective_samples)
+        )
+        print(
+            'Smoke training sample limiter active: using {} of {} '
+            'training samples.'.format(
+                effective_samples, len(train_dataset)
+            )
+        )
+    return datasets
+
+
 class Reg_Trainer(Trainer):
     def setup(self):
         args = self.args
@@ -105,6 +121,9 @@ class Reg_Trainer(Trainer):
                                         concat_size=args.concat_size,
                                         tokenizer=self.model.clip.tokenizer)
                          for x in ['train', 'val', 'test']}
+        apply_smoke_train_sample_limit(
+            self.datasets, args.smoke_train_samples
+        )
 
         self.dataloaders = {x: DataLoader(self.datasets[x],
                                           batch_size=(args.batch_size

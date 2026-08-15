@@ -40,6 +40,8 @@ def parse_arg():
                         help='the path of the resume training model')
     parser.add_argument('--batch-size', default=4, type=int,
                         help='the number of samples in a batch')
+    parser.add_argument('--smoke-train-samples', default=0, type=int,
+                        help='limit only the training split for infrastructure smoke tests; 0 disables')
     parser.add_argument('--stride', default=384, type=int,
                         help='the stride for patchify')
     parser.add_argument('--beta', default=1e-4, type=float,
