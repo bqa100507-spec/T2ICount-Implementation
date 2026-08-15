@@ -14,15 +14,34 @@ DEFAULT_UNET_CONFIG = {
     "attn_selector": "down_cross+up_cross",
 }
 
+LEGACY_NONPERSISTENT_BUFFER_KEYS = frozenset({
+    "clip.transformer.text_model.embeddings.position_ids",
+})
 
-def load_t2icount_checkpoint(model, checkpoint_path, strict=True):
+
+def _remove_legacy_nonpersistent_buffers(state_dict):
+    removed = []
+    for key in LEGACY_NONPERSISTENT_BUFFER_KEYS:
+        if key in state_dict:
+            del state_dict[key]
+            removed.append(key)
+    if removed:
+        print(
+            "Removed legacy non-persistent checkpoint buffer(s): {}"
+            .format(", ".join(sorted(removed)))
+        )
+    return state_dict
+
+
+def load_t2icount_checkpoint(model, checkpoint_path):
     checkpoint = require_file(checkpoint_path, "T2ICount checkpoint")
     state = load_trusted_legacy_checkpoint(
         str(checkpoint), map_location="cpu"
     )
     if isinstance(state, dict) and "model_state_dict" in state:
         state = state["model_state_dict"]
-    model.load_state_dict(state, strict=strict)
+    state = _remove_legacy_nonpersistent_buffers(state)
+    model.load_state_dict(state, strict=True)
     return model
 
 
