@@ -157,7 +157,7 @@ class Reg_Trainer(Trainer):
                 )
 
     def _load_training_checkpoint(self, path):
-        checkpoint = load_trusted_legacy_checkpoint(path, self.device)
+        checkpoint = load_trusted_legacy_checkpoint(path, 'cpu')
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.start_epoch = checkpoint.get(
