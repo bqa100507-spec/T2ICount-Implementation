@@ -68,14 +68,6 @@ class AssetPaths:
     def official_checkpoint(self) -> Path:
         return self.root / "checkpoints" / "official" / "best_model_paper.pth"
 
-    @property
-    def baseline_checkpoint_dir(self) -> Path:
-        return self.root / "checkpoints" / "baseline_retrain"
-
-    @property
-    def output_dir(self) -> Path:
-        return self.root / "outputs"
-
     def dataset_dir(self, dataset: str) -> Path:
         names = {
             "fsc147": "FSC147",

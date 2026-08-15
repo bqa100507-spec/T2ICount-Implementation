@@ -57,11 +57,9 @@ def main():
         ('Stable Diffusion checkpoint', args.sd_path or assets.sd_checkpoint, require_file),
         ('{} dataset'.format(args.data.upper()),
          args.dataset_root or assets.dataset_dir(args.data), require_directory),
+        ('T2ICount checkpoint',
+         args.model_path or assets.official_checkpoint, require_file),
     ]
-    if args.model_path:
-        checks.append(('T2ICount checkpoint', args.model_path, require_file))
-    elif assets.official_checkpoint.exists():
-        checks.append(('T2ICount checkpoint', assets.official_checkpoint, require_file))
 
     validated = {}
     for label, path, validator in checks:

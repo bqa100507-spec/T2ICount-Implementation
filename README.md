@@ -56,8 +56,8 @@ git clone https://github.com/bqa100507-spec/T2ICount-Implementation.git
 cd T2ICount-Implementation
 ```
 
-Code and small configuration files live in this repository. Models, datasets,
-checkpoints, and generated outputs live in one external directory:
+Code and small configuration files live in this repository. Read-only model,
+dataset, and official-checkpoint assets live in one external directory:
 
 ```text
 T2ICount-assets/
@@ -68,11 +68,8 @@ T2ICount-assets/
 |   |-- FSC147/
 |   |-- CARPK/
 |   `-- IDCIA/
-|-- checkpoints/
-|   |-- official/best_model_paper.pth
-|   |-- baseline_retrain/
-|   `-- dumlo/
-`-- outputs/
+`-- checkpoints/
+    `-- official/best_model_paper.pth
 ```
 
 `FSC147/` retains `images_384_VarV2/`,
@@ -100,12 +97,12 @@ upstream SD/T2ICount checkpoint path is sensitive to framework changes. See
 ### Colab with Google Drive
 
 Open `notebooks/train_colab.ipynb`. It mounts Drive, clones/opens this repo,
-installs dependencies, sets
-`T2ICOUNT_ASSET_ROOT=/content/drive/MyDrive/T2ICount-assets`, validates assets,
-and runs a one-image smoke test. It also documents the separate environment
-exports required by a VSCode terminal connected to the Colab runtime. The
-notebook contains orchestration only and does not start full training
-automatically.
+copies `/content/drive/MyDrive/T2ICount-assets.zip` to local Colab storage when
+the required runtime assets are incomplete, and extracts it as
+`/content/T2ICount-assets`. It sets
+`T2ICOUNT_ASSET_ROOT=/content/T2ICount-assets`, validates the four required
+local assets, and runs a one-image smoke test from that local root. The notebook
+contains orchestration only and does not start full training automatically.
 
 Long-running Colab runs should use an explicit Drive save directory, such as
 `/content/drive/MyDrive/T2ICount-assets/checkpoints/baseline_retrain/run_01`,
@@ -114,6 +111,10 @@ optimizer state, the next epoch, best validation metrics, and RNG state. This
 project has no LR scheduler or AMP scaler, so there is no scheduler/scaler state
 to restore. Legacy `.tar` checkpoints remain loadable; `.pth` files are
 weights-only and are not accepted by `--resume`.
+
+The runtime asset root is treated as read-only. Evaluation CSVs default to the
+repository-local `results/` directory unless `--results-path` is supplied, and
+training requires an explicit writable `--save-dir`.
 
 IDCIA result analysis and density-map visualization are in
 `notebooks/visualize_results.ipynb`; this notebook uses the same external asset,
@@ -195,7 +196,7 @@ The upstream authors report reproducibility results and provide an
 [upstream training log](https://github.com/cha15yq/T2ICount/blob/main/logs/train.log)
 and [reproduced model](https://drive.google.com/file/d/1VN5uI9F0XjKQ-JwjOpMYYJF5ku92znO_/view?usp=sharing).
 ```
-python train.py --content exp --crop-size 384 --concat-size 224 --batch-size 16 --lr 5e-5 --weight-decay 5e-5
+python train.py --asset-root "$T2ICOUNT_ASSET_ROOT" --save-dir "/path/to/writable/checkpoints" --content exp --crop-size 384 --concat-size 224 --batch-size 16 --lr 5e-5 --weight-decay 5e-5
 ```
 ---
 ## Evaluation and the pretrained model

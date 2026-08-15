@@ -32,7 +32,7 @@ def parse_arg():
                         help='local CLIP directory; defaults under the asset root')
 
     parser.add_argument('--save-dir', default=None,
-                        help='directory for checkpoints/logs; defaults under the asset root')
+                        help='required writable directory for checkpoints/logs')
 
     parser.add_argument('--max-num', default=2, type=int,
                         help='the maximum number of saved models ')
@@ -81,11 +81,9 @@ def resolve_training_paths(args):
         'FSC147 dataset'
     ))
     if args.save_dir is None:
-        if assets is None:
-            raise ValueError(
-                '--save-dir is required when T2ICOUNT_ASSET_ROOT is not configured.'
-            )
-        args.save_dir = str(assets.baseline_checkpoint_dir)
+        raise ValueError(
+            '--save-dir is required; the runtime asset root is read-only.'
+        )
     if args.resume:
         args.resume = str(require_file(args.resume, 'resume checkpoint'))
     return args

@@ -60,7 +60,7 @@ def parse_arg():
         help='IDCIA image preprocessing; ignored for FSC-147 and CARPK.'
     )
     parser.add_argument('--results-path', default=None, type=str,
-                        help='IDCIA CSV path; defaults under the asset output directory.')
+                        help='IDCIA CSV path; defaults to results/idcia_predictions.csv.')
     parser.add_argument('--device', default='cuda', type=str)
     parser.add_argument('--max-samples', default=None, type=int,
                         help='Optional smoke-test limit applied to the selected dataset.')
@@ -281,8 +281,6 @@ def resolve_cli_paths(args):
     config_path = require_file(args.config, 'Stable Diffusion config')
     if args.results_path:
         results_path = Path(args.results_path).expanduser().resolve()
-    elif assets:
-        results_path = assets.output_dir / 'idcia_predictions.csv'
     else:
         results_path = Path('results/idcia_predictions.csv').resolve()
     return config_path, sd_path, clip_path, model_path, dataset_root, results_path

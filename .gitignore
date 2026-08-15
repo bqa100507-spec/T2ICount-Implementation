@@ -30,6 +30,7 @@ venv/
 
 # Generated training/evaluation artifacts
 /outputs/
+/results/
 /history/
 /logs/
 lightning_logs/

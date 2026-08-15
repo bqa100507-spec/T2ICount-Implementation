@@ -1,8 +1,10 @@
+import os
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import torch
@@ -10,6 +12,31 @@ import torch
 from utils.checkpoints import load_trusted_legacy_checkpoint
 from utils.inference import build_prompt_attention_mask, predict_count
 from utils.paths import AssetPathError, AssetPaths, require_directory
+from scripts import check_assets
+from test import resolve_cli_paths
+from train import resolve_training_paths
+
+
+def _create_runtime_assets(root, include_official_checkpoint=True):
+    clip_dir = root / 'pretrained' / 'clip-vit-large-patch14'
+    fsc147_dir = root / 'datasets' / 'FSC147'
+    clip_dir.mkdir(parents=True)
+    fsc147_dir.mkdir(parents=True)
+
+    sd_checkpoint = (
+        root / 'pretrained' / 'sd-v1-5' / 'v1-5-pruned-emaonly.ckpt'
+    )
+    sd_checkpoint.parent.mkdir(parents=True)
+    sd_checkpoint.touch()
+
+    official_checkpoint = (
+        root / 'checkpoints' / 'official' / 'best_model_paper.pth'
+    )
+    if include_official_checkpoint:
+        official_checkpoint.parent.mkdir(parents=True)
+        official_checkpoint.touch()
+
+    return AssetPaths(root)
 
 
 class _Tokenizer:
@@ -102,6 +129,109 @@ class InfrastructureTests(unittest.TestCase):
             root / 'pretrained' / 'clip-vit-large-patch14',
         )
         self.assertEqual(paths.dataset_dir('idcia'), root / 'datasets' / 'IDCIA')
+
+    def test_test_cli_asset_root_overrides_stale_environment_root(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            runtime_root = temp_root / 'runtime-assets'
+            stale_drive_root = temp_root / 'drive-assets'
+            assets = _create_runtime_assets(runtime_root)
+            stale_drive_root.mkdir()
+            config = temp_root / 'v1-inference.yaml'
+            config.touch()
+            args = SimpleNamespace(
+                asset_root=str(runtime_root),
+                clip_path=None,
+                sd_path=None,
+                model_path=None,
+                data='fsc147',
+                idcia_root=None,
+                dataset_root=None,
+                config=str(config),
+                results_path=None,
+            )
+
+            with mock.patch.dict(
+                os.environ,
+                {'T2ICOUNT_ASSET_ROOT': str(stale_drive_root)},
+            ):
+                resolved = resolve_cli_paths(args)
+
+            self.assertEqual(resolved[1], assets.sd_checkpoint)
+            self.assertEqual(resolved[2], assets.clip_dir)
+            self.assertEqual(resolved[3], assets.official_checkpoint)
+            self.assertEqual(resolved[4], assets.dataset_dir('fsc147'))
+            self.assertEqual(
+                resolved[5], Path('results/idcia_predictions.csv').resolve()
+            )
+
+    def test_training_save_root_does_not_change_runtime_asset_reads(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            runtime_root = temp_root / 'runtime-assets'
+            drive_root = temp_root / 'drive-assets'
+            assets = _create_runtime_assets(runtime_root)
+            config = temp_root / 'v1-inference.yaml'
+            config.touch()
+            save_dir = drive_root / 'checkpoints' / 'baseline_retrain'
+            args = SimpleNamespace(
+                asset_root=str(runtime_root),
+                config=str(config),
+                sd_path=None,
+                clip_path=None,
+                data_dir=None,
+                save_dir=str(save_dir),
+                resume='',
+            )
+
+            resolved = resolve_training_paths(args)
+
+            self.assertEqual(Path(resolved.sd_path), assets.sd_checkpoint)
+            self.assertEqual(Path(resolved.clip_path), assets.clip_dir)
+            self.assertEqual(
+                Path(resolved.data_dir), assets.dataset_dir('fsc147')
+            )
+            self.assertEqual(Path(resolved.save_dir), save_dir)
+
+    def test_training_requires_explicit_writable_save_directory(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            runtime_root = temp_root / 'runtime-assets'
+            _create_runtime_assets(runtime_root)
+            config = temp_root / 'v1-inference.yaml'
+            config.touch()
+            args = SimpleNamespace(
+                asset_root=str(runtime_root),
+                config=str(config),
+                sd_path=None,
+                clip_path=None,
+                data_dir=None,
+                save_dir=None,
+                resume='',
+            )
+
+            with self.assertRaisesRegex(ValueError, 'runtime asset root is read-only'):
+                resolve_training_paths(args)
+
+    def test_asset_check_requires_official_checkpoint_from_runtime_root(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runtime_root = Path(temp_dir) / 'runtime-assets'
+            _create_runtime_assets(
+                runtime_root, include_official_checkpoint=False
+            )
+            args = SimpleNamespace(
+                asset_root=str(runtime_root),
+                clip_path=None,
+                sd_path=None,
+                data='fsc147',
+                dataset_root=None,
+                model_path=None,
+                device='cpu',
+                check_offline_load=False,
+            )
+
+            with mock.patch.object(check_assets, 'parse_args', return_value=args):
+                self.assertEqual(check_assets.main(), 1)
 
     def test_missing_directory_error_is_absolute(self):
         with tempfile.TemporaryDirectory() as temp_dir:

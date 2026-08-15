@@ -4,6 +4,12 @@
 `DIR/RUN`. Point `DIR` at Google Drive for Colab training; files under
 `/content` disappear when the runtime is recycled.
 
+In Colab, runtime assets are read from `/content/T2ICount-assets`, while
+training checkpoints and logs are written to
+`/content/drive/MyDrive/T2ICount-assets`. Keep `T2ICOUNT_ASSET_ROOT` and
+`--asset-root` pointed at the local runtime root; `--save-dir` is the separate
+writable destination.
+
 Periodic `*_ckpt.tar` files are full-state resume checkpoints. Version 2 stores:
 
 - model state;
@@ -25,7 +31,7 @@ Example:
 
 ```bash
 python train.py \
-  --asset-root "/content/drive/MyDrive/T2ICount-assets" \
+  --asset-root "/content/T2ICount-assets" \
   --save-dir "/content/drive/MyDrive/T2ICount-assets/checkpoints/baseline_retrain" \
   --content run_01 \
   --resume "/content/drive/MyDrive/T2ICount-assets/checkpoints/baseline_retrain/run_01/50_ckpt.tar"
