@@ -11,6 +11,7 @@ import time
 import random
 import torch.nn.functional as F
 import torch.nn as nn
+from tqdm import tqdm
 from utils.checkpoints import load_trusted_legacy_checkpoint
 from utils.ssim_loss import cal_avg_ms_ssim
 from utils.inference import predict_count
@@ -109,6 +110,10 @@ def apply_train_sample_subset(datasets, sample_limit, subset_seed):
             )
         )
     return datasets
+
+
+def progress_dataloader(dataloader, description):
+    return tqdm(dataloader, desc=description)
 
 
 class Reg_Trainer(Trainer):
@@ -238,8 +243,12 @@ class Reg_Trainer(Trainer):
         epoch_mse = AverageMeter()
         epoch_start = time.time()
 
+        train_dataloader = self.dataloaders['train']
+        train_progress = progress_dataloader(
+            train_dataloader, 'Train epoch {}'.format(self.epoch)
+        )
         for step, (input, den_map, caption, prompt_attn_mask, img_attn_mask) in enumerate(
-                self.dataloaders['train']):
+                train_progress):
             inputs = input.to(self.device)
             gt_den_maps = den_map.to(self.device) * 60
             gt_prompt_attn_mask = prompt_attn_mask.to(self.device).unsqueeze(2).unsqueeze(3)
@@ -269,6 +278,19 @@ class Reg_Trainer(Trainer):
                 self.optimizer.zero_grad()
                 loss.backward()
                 self.optimizer.step()
+
+                completed_steps = step + 1
+                if (
+                    completed_steps % 10 == 0
+                    or completed_steps == len(train_dataloader)
+                ):
+                    train_progress.set_postfix(
+                        reg='{:.4f}'.format(epoch_reg_loss.getAvg()),
+                        rrc1='{:.4f}'.format(epoch_RRC1_loss.getAvg()),
+                        rrc2='{:.4f}'.format(epoch_RRC2_loss.getAvg()),
+                        mae='{:.2f}'.format(epoch_mae.getAvg()),
+                        refresh=False,
+                    )
 
         logging.info(
             'Epoch {} Train, reg:{:.4f}, RRC_stage1:{:.4f}, RRC_stage2:{:.4f}, mae:{:.2f}, mse:{:.2f}, Cost: {:.1f} sec '
@@ -305,7 +327,10 @@ class Reg_Trainer(Trainer):
     def _evaluate_split(self, split):
         self.model.set_eval()
         epoch_res = []
-        for inputs, gt_counts, captions, prompt_attn_mask, name in self.dataloaders[split]:
+        evaluation_progress = progress_dataloader(
+            self.dataloaders[split], split.capitalize()
+        )
+        for inputs, gt_counts, captions, prompt_attn_mask, name in evaluation_progress:
             inputs = inputs.to(self.device)
             prediction = predict_count(
                 self.model,
