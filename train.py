@@ -46,6 +46,23 @@ def parse_arg():
                         help='randomly subset the training split; 0 uses the full split')
     parser.add_argument('--train-subset-seed', default=3407, type=int,
                         help='seed for deterministic training subset selection')
+    parser.add_argument('--loss-mode', choices=('baseline', 'dumlo'),
+                        default='baseline',
+                        help='opt-in training regression loss')
+    parser.add_argument('--dumlo-lambda-ot', default=0.1, type=float,
+                        help='DUMLO optimal-transport loss weight')
+    parser.add_argument('--dumlo-lambda-tv', default=0.01, type=float,
+                        help='DUMLO total-variation loss weight')
+    parser.add_argument('--dumlo-epsilon', default=10.0, type=float,
+                        help='DUMLO entropic regularization epsilon')
+    parser.add_argument('--dumlo-iters', default=100, type=int,
+                        help='number of DUMLO Trihorn iterations')
+    parser.add_argument('--dumlo-aug-points', default=10, type=int,
+                        help='additional adaptive samples per annotation')
+    parser.add_argument('--dumlo-radius-factor', default=0.5, type=float,
+                        help='nearest-neighbor sampling radius multiplier')
+    parser.add_argument('--dumlo-sampling-seed', default=3407, type=int,
+                        help='private deterministic DUMLO sampling seed')
     parser.add_argument('--stride', default=384, type=int,
                         help='the stride for patchify')
     parser.add_argument('--beta', default=1e-4, type=float,

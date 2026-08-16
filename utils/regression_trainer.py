@@ -15,6 +15,7 @@ from tqdm import tqdm
 from utils.checkpoints import load_trusted_legacy_checkpoint
 from utils.ssim_loss import cal_avg_ms_ssim
 from utils.inference import predict_count
+from losses.dumlo import DUMLOLoss
 
 
 def setup_seed(seed):
@@ -66,7 +67,27 @@ def train_collate(batch):
     prompt = transposed_batch[2]
     prompt_attn_mask = torch.stack(transposed_batch[3], 0)
     img_attn_mask = torch.stack(transposed_batch[4], 0)
-    return images, den, prompt, prompt_attn_mask, img_attn_mask
+    collated = (images, den, prompt, prompt_attn_mask, img_attn_mask)
+    if len(transposed_batch) == 6:
+        return collated + (list(transposed_batch[5]),)
+    return collated
+
+
+def compute_regression_loss(loss_mode, pred_den, gt_den_maps,
+                            point_sets=None, dumlo_loss=None,
+                            input_h=None, input_w=None, epoch=0, step=0):
+    if loss_mode == 'baseline':
+        return get_reg_loss(
+            pred_den, gt_den_maps, threshold=1e-3 * 60
+        ), None
+    if loss_mode == 'dumlo':
+        if dumlo_loss is None or point_sets is None:
+            raise ValueError('DUMLO mode requires DUMLOLoss and point sets')
+        return dumlo_loss(
+            pred_den, point_sets, input_h=input_h, input_w=input_w,
+            epoch=epoch, step=step,
+        )
+    raise ValueError('unsupported loss mode: {}'.format(loss_mode))
 
 
 def validate_train_sample_options(args):
@@ -152,7 +173,11 @@ class Reg_Trainer(Trainer):
                                         downsample_ratio=self.d_ratio,
                                         method=x,
                                         concat_size=args.concat_size,
-                                        tokenizer=self.model.clip.tokenizer)
+                                        tokenizer=self.model.clip.tokenizer,
+                                        return_points=(
+                                            x == 'train'
+                                            and args.loss_mode == 'dumlo'
+                                        ))
                          for x in ['train', 'val', 'test']}
         apply_train_sample_subset(
             self.datasets, args.train_samples, args.train_subset_seed
@@ -176,6 +201,18 @@ class Reg_Trainer(Trainer):
             {'params': self.model.decoder.parameters(),
              'lr': args.lr,
              'weight_decay': args.weight_decay}])
+
+        self.dumlo_loss = None
+        if args.loss_mode == 'dumlo':
+            self.dumlo_loss = DUMLOLoss(
+                lambda_ot=args.dumlo_lambda_ot,
+                lambda_tv=args.dumlo_lambda_tv,
+                epsilon=args.dumlo_epsilon,
+                num_iters=args.dumlo_iters,
+                augmentation_points=args.dumlo_aug_points,
+                radius_factor=args.dumlo_radius_factor,
+                sampling_seed=args.dumlo_sampling_seed,
+            )
 
         self.start_epoch = args.start_epoch
         self.best_mae = np.inf
@@ -241,14 +278,25 @@ class Reg_Trainer(Trainer):
         epoch_RRC2_loss = AverageMeter()
         epoch_mae = AverageMeter()
         epoch_mse = AverageMeter()
+        if self.args.loss_mode == 'dumlo':
+            epoch_count_loss = AverageMeter()
+            epoch_ot_loss = AverageMeter()
+            epoch_tv_loss = AverageMeter()
+            epoch_pred_count = AverageMeter()
+            epoch_signed_error = AverageMeter()
         epoch_start = time.time()
 
         train_dataloader = self.dataloaders['train']
         train_progress = progress_dataloader(
             train_dataloader, 'Train epoch {}'.format(self.epoch)
         )
-        for step, (input, den_map, caption, prompt_attn_mask, img_attn_mask) in enumerate(
-                train_progress):
+        for step, batch in enumerate(train_progress):
+            if self.args.loss_mode == 'dumlo':
+                (input, den_map, caption, prompt_attn_mask,
+                 img_attn_mask, point_sets) = batch
+            else:
+                input, den_map, caption, prompt_attn_mask, img_attn_mask = batch
+                point_sets = None
             inputs = input.to(self.device)
             gt_den_maps = den_map.to(self.device) * 60
             gt_prompt_attn_mask = prompt_attn_mask.to(self.device).unsqueeze(2).unsqueeze(3)
@@ -259,7 +307,17 @@ class Reg_Trainer(Trainer):
                 pred_den, sim_x2, sim_x1, fused_cross_attn = self.model(inputs, caption, gt_prompt_attn_mask)
                 fused_cross_attn_ = fused_cross_attn * gt_img_attn_mask
                 AN = fused_cross_attn_ >= 0.3 
-                reg_loss = get_reg_loss(pred_den, gt_den_maps, threshold=1e-3 * 60)
+                reg_loss, dumlo_diagnostics = compute_regression_loss(
+                    self.args.loss_mode,
+                    pred_den,
+                    gt_den_maps,
+                    point_sets=point_sets,
+                    dumlo_loss=self.dumlo_loss,
+                    input_h=self.args.crop_size,
+                    input_w=self.args.crop_size,
+                    epoch=self.epoch,
+                    step=step,
+                )
                 P = gt_den_maps >= (1e-3 * 60)
                 rrc_loss_stage1 = RRC_loss(sim_x2, AN, P)
                 rrc_loss_stage2 = RRC_loss(sim_x1, AN, P)
@@ -269,7 +327,32 @@ class Reg_Trainer(Trainer):
                 epoch_RRC2_loss.update(rrc_loss_stage2.item(), N)
                 loss = reg_loss + 0.01 * rrc_loss_stage1 + 0.01 * rrc_loss_stage2
 
-                gt_counts = torch.sum(gt_den_maps.view(N, -1), dim=1).detach().cpu().numpy() / 60
+                if dumlo_diagnostics is not None:
+                    epoch_count_loss.update(
+                        dumlo_diagnostics['count_loss'].item(), N
+                    )
+                    epoch_ot_loss.update(
+                        dumlo_diagnostics['ot_loss'].item(), N
+                    )
+                    epoch_tv_loss.update(
+                        dumlo_diagnostics['tv_loss'].item(), N
+                    )
+                    epoch_pred_count.update(
+                        dumlo_diagnostics['mean_pred_count'].item(), N
+                    )
+                    epoch_signed_error.update(
+                        dumlo_diagnostics[
+                            'mean_signed_count_error'
+                        ].item(), N
+                    )
+
+                if point_sets is None:
+                    gt_counts = torch.sum(gt_den_maps.view(N, -1), dim=1).detach().cpu().numpy() / 60
+                else:
+                    gt_counts = np.asarray(
+                        [len(points) for points in point_sets],
+                        dtype=np.float32,
+                    )
                 pred_counts = torch.sum(pred_den.view(N, -1), dim=1).detach().cpu().numpy() / 60
                 diff = pred_counts - gt_counts
                 epoch_mae.update(np.mean(np.abs(diff)).item(), N)
@@ -284,18 +367,49 @@ class Reg_Trainer(Trainer):
                     completed_steps % 10 == 0
                     or completed_steps == len(train_dataloader)
                 ):
-                    train_progress.set_postfix(
-                        reg='{:.4f}'.format(epoch_reg_loss.getAvg()),
-                        rrc1='{:.4f}'.format(epoch_RRC1_loss.getAvg()),
-                        rrc2='{:.4f}'.format(epoch_RRC2_loss.getAvg()),
-                        mae='{:.2f}'.format(epoch_mae.getAvg()),
-                        refresh=False,
-                    )
+                    if self.args.loss_mode == 'dumlo':
+                        train_progress.set_postfix(
+                            reg='{:.4f}'.format(epoch_reg_loss.getAvg()),
+                            rrc1='{:.4f}'.format(epoch_RRC1_loss.getAvg()),
+                            rrc2='{:.4f}'.format(epoch_RRC2_loss.getAvg()),
+                            mae='{:.2f}'.format(epoch_mae.getAvg()),
+                            count='{:.4f}'.format(epoch_count_loss.getAvg()),
+                            ot='{:.4f}'.format(epoch_ot_loss.getAvg()),
+                            tv='{:.4f}'.format(epoch_tv_loss.getAvg()),
+                            pred_count='{:.2f}'.format(epoch_pred_count.getAvg()),
+                            signed_error='{:.2f}'.format(epoch_signed_error.getAvg()),
+                            refresh=False,
+                        )
+                    else:
+                        train_progress.set_postfix(
+                            reg='{:.4f}'.format(epoch_reg_loss.getAvg()),
+                            rrc1='{:.4f}'.format(epoch_RRC1_loss.getAvg()),
+                            rrc2='{:.4f}'.format(epoch_RRC2_loss.getAvg()),
+                            mae='{:.2f}'.format(epoch_mae.getAvg()),
+                            refresh=False,
+                        )
 
-        logging.info(
-            'Epoch {} Train, reg:{:.4f}, RRC_stage1:{:.4f}, RRC_stage2:{:.4f}, mae:{:.2f}, mse:{:.2f}, Cost: {:.1f} sec '
-            .format(self.epoch, epoch_reg_loss.getAvg(), epoch_RRC1_loss.getAvg(), epoch_RRC2_loss.getAvg(), epoch_mae.getAvg(),
-                    np.sqrt(epoch_mse.getAvg()), (time.time() - epoch_start)))
+        if self.args.loss_mode == 'dumlo':
+            logging.info(
+                'Epoch {} Train, reg:{:.4f}, RRC_stage1:{:.4f}, '
+                'RRC_stage2:{:.4f}, mae:{:.2f}, mse:{:.2f}, count:{:.4f}, '
+                'ot:{:.4f}, tv:{:.4f}, pred_count:{:.2f}, '
+                'signed_error:{:.2f}, Cost: {:.1f} sec '
+                .format(
+                    self.epoch, epoch_reg_loss.getAvg(),
+                    epoch_RRC1_loss.getAvg(), epoch_RRC2_loss.getAvg(),
+                    epoch_mae.getAvg(), np.sqrt(epoch_mse.getAvg()),
+                    epoch_count_loss.getAvg(), epoch_ot_loss.getAvg(),
+                    epoch_tv_loss.getAvg(), epoch_pred_count.getAvg(),
+                    epoch_signed_error.getAvg(),
+                    (time.time() - epoch_start),
+                )
+            )
+        else:
+            logging.info(
+                'Epoch {} Train, reg:{:.4f}, RRC_stage1:{:.4f}, RRC_stage2:{:.4f}, mae:{:.2f}, mse:{:.2f}, Cost: {:.1f} sec '
+                .format(self.epoch, epoch_reg_loss.getAvg(), epoch_RRC1_loss.getAvg(), epoch_RRC2_loss.getAvg(), epoch_mae.getAvg(),
+                        np.sqrt(epoch_mse.getAvg()), (time.time() - epoch_start)))
 
     def val_epoch(self):
         epoch_start = time.time()

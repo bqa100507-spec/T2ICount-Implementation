@@ -25,9 +25,72 @@ def random_crop(im_h, im_w, crop_h, crop_w):
     return i, j, crop_h, crop_w
 
 
+def as_point_tensor(points):
+    point_tensor = torch.as_tensor(points, dtype=torch.float32)
+    if point_tensor.numel() == 0:
+        return point_tensor.reshape(0, 2)
+    if point_tensor.ndim != 2 or point_tensor.shape[1] != 2:
+        raise ValueError('points must have shape [N, 2] in [x, y] order')
+    return point_tensor.clone()
+
+
+def crop_points(points, top, left, height, width):
+    """Retain points inside a crop and translate them to crop-local [x, y]."""
+    points = as_point_tensor(points)
+    if points.numel() == 0:
+        return points
+    keep = (
+        (points[:, 0] >= left)
+        & (points[:, 0] < left + width)
+        & (points[:, 1] >= top)
+        & (points[:, 1] < top + height)
+    )
+    cropped = points[keep].clone()
+    cropped[:, 0] -= left
+    cropped[:, 1] -= top
+    return cropped
+
+
+def resize_points(points, old_width, old_height, new_width, new_height):
+    """Scale [x, y] coordinates using the image's actual integer dimensions."""
+    points = as_point_tensor(points)
+    if points.numel() == 0:
+        return points
+    resized = points.clone()
+    resized[:, 0] *= float(new_width) / float(old_width)
+    resized[:, 1] *= float(new_height) / float(old_height)
+    return resized
+
+
+def horizontal_flip_points(points, width):
+    points = as_point_tensor(points)
+    if points.numel() == 0:
+        return points
+    flipped = points.clone()
+    flipped[:, 0] = (width - 1) - flipped[:, 0]
+    return flipped
+
+
+def assemble_2x2_points(tiles, tile_size):
+    """Translate cropped tile points after the existing random tile shuffle."""
+    offsets = ((0, 0), (tile_size, 0), (0, tile_size),
+               (tile_size, tile_size))
+    translated = []
+    for tile, (offset_x, offset_y) in zip(tiles, offsets):
+        tile_points = as_point_tensor(tile['points'])
+        if tile_points.numel() == 0:
+            continue
+        tile_points[:, 0] += offset_x
+        tile_points[:, 1] += offset_y
+        translated.append(tile_points)
+    if not translated:
+        return torch.empty((0, 2), dtype=torch.float32)
+    return torch.cat(translated, dim=0)
+
+
 class ObjectCount(Dataset):
     def __init__(self, root, crop_size, downsample_ratio, method='train', concat_size=224,
-                 tokenizer=None, clip_path=None):
+                 tokenizer=None, clip_path=None, return_points=False):
         super(ObjectCount, self).__init__()
         #self.im_list = sorted(glob(os.path.join(root, 'images/*.jpg')))
         assert crop_size % downsample_ratio == 0
@@ -43,6 +106,7 @@ class ObjectCount(Dataset):
             raise ValueError("ObjectCount requires tokenizer or an explicit local clip_path.")
         self.tokenizer = tokenizer or load_clip_tokenizer(clip_path)
         self.concat_size = concat_size
+        self.return_points = return_points
 
         with open(os.path.join(root, 'FSC_147/Train_Test_Val_FSC_147.json'), 'r') as f:
             data_split = json.load(f)[method]
@@ -66,6 +130,7 @@ class ObjectCount(Dataset):
         img = Image.open(im_path).convert('RGB')
         cls_name = self.cls_dict[os.path.basename(im_path)]
         pts = self.annotations[os.path.basename(im_path)]['points']
+        out_points = as_point_tensor(pts) if self.return_points else None
 
         prompt = cls_name
 
@@ -96,6 +161,8 @@ class ObjectCount(Dataset):
                         cls_name_tokens = self.tokenizer(prompt, add_special_tokens=False, return_tensors='pt')
                         cls_name_length = cls_name_tokens['input_ids'].shape[1]
                         prompt_attn_mask[1: 1 + cls_name_length] = 1
+                        if self.return_points:
+                            out_points = torch.empty((0, 2), dtype=torch.float32)
                     else:
                         wd, ht = img.size
                         den_map = np.load(den_path)
@@ -108,7 +175,13 @@ class ObjectCount(Dataset):
                     img = F.crop(img, i, j, h, w)
                     den_map = np.load(den_path)[i: (i + h), j: (j + w)]
                     img_attn_map = np.ones((self.concat_size, self.concat_size))
-                    imgs_info.append({'img': img, 'den_map': den_map, 'img_attention_map': img_attn_map})
+                    imgs_info.append({
+                        'img': img,
+                        'den_map': den_map,
+                        'img_attention_map': img_attn_map,
+                        'points': (crop_points(out_points, i, j, h, w)
+                                   if self.return_points else None),
+                    })
                     for rand_img in rand_imgs:
                         extra_img = Image.open(rand_img).convert('RGB')
                         wd, ht = extra_img.size
@@ -117,10 +190,22 @@ class ObjectCount(Dataset):
                         if self.cls_dict[os.path.basename(rand_img)] == cls_name:
                             extra_den_map = np.load(rand_img.replace('images_384_VarV2', 'gt_density_map_adaptive_384_VarV2').replace('jpg', 'npy'))[i: (i + h), j: (j + w)]
                             extra_img_attention = np.ones((self.concat_size, self.concat_size))
+                            if self.return_points:
+                                extra_points = crop_points(
+                                    self.annotations[os.path.basename(rand_img)]['points'],
+                                    i, j, h, w,
+                                )
                         else:
                             extra_den_map = np.zeros((self.concat_size, self.concat_size))
                             extra_img_attention = np.zeros((self.concat_size, self.concat_size))
-                        imgs_info.append({'img': extra_img, 'den_map': extra_den_map, 'img_attention_map': extra_img_attention})
+                            if self.return_points:
+                                extra_points = torch.empty((0, 2), dtype=torch.float32)
+                        imgs_info.append({
+                            'img': extra_img,
+                            'den_map': extra_den_map,
+                            'img_attention_map': extra_img_attention,
+                            'points': extra_points if self.return_points else None,
+                        })
 
                     random.shuffle(imgs_info)
                     out_img = Image.new('RGB', (self.concat_size * 2, self.concat_size * 2))
@@ -145,20 +230,36 @@ class ObjectCount(Dataset):
                     img_attn_map[self.concat_size:self.concat_size * 2, self.concat_size:self.concat_size * 2] = \
                         imgs_info[3]['img_attention_map']
 
-            img, den_map, img_attn_map = self.train_transform_density(out_img, den_map, img_attn_map)
+                    if self.return_points:
+                        out_points = assemble_2x2_points(
+                            imgs_info, self.concat_size
+                        )
+
+            transformed = self.train_transform_density(
+                out_img, den_map, img_attn_map, out_points
+            )
+            if self.return_points:
+                img, den_map, img_attn_map, out_points = transformed
+                return (img, den_map, prompt, prompt_attn_mask,
+                        img_attn_map, out_points)
+            img, den_map, img_attn_map = transformed
             return img, den_map, prompt, prompt_attn_mask, img_attn_map
         else:
             return self.transform(img), len(pts), prompt, prompt_attn_mask, os.path.basename(im_path).split('.')[0]
 
-    def train_transform_density(self, img, den_map, img_attention_map):
+    def train_transform_density(self, img, den_map, img_attention_map,
+                                points=None):
         wd, ht = img.size
         if random.random() >= 0.5:
+            old_wd, old_ht = wd, ht
             re_size = random.random() * 1 + 1
             wd = int(wd * re_size)
             ht = int(ht * re_size)
             img = img.resize((wd, ht), Image.Resampling.BICUBIC)
             den_map = cv2.resize(den_map, (wd, ht), interpolation=cv2.INTER_CUBIC) / (re_size ** 2)
             img_attention_map = cv2.resize(img_attention_map, (wd, ht), interpolation=cv2.INTER_NEAREST)
+            if points is not None:
+                points = resize_points(points, old_wd, old_ht, wd, ht)
 
         i, j, h, w = random_crop(ht, wd, self.crop_size, self.crop_size)
         img = F.crop(img, i, j, h, w)
@@ -167,13 +268,24 @@ class ObjectCount(Dataset):
             axis=(1, 3))
         img_attention_map = img_attention_map[i: (i + h), j: (j + w)]
         img_attention_map = cv2.resize(img_attention_map, (int(w / 8), int(h / 8)), interpolation=cv2.INTER_NEAREST)
+        if points is not None:
+            points = crop_points(points, i, j, h, w)
 
         if random.random() > 0.5:
             img = F.hflip(img)
             den_map = np.fliplr(den_map)
             img_attention_map = np.fliplr(img_attention_map)
+            if points is not None:
+                points = horizontal_flip_points(points, w)
 
-        return self.transform(img), torch.from_numpy(den_map.copy()).float().unsqueeze(0), torch.from_numpy(img_attention_map.copy()).float().unsqueeze(0)
+        transformed = (
+            self.transform(img),
+            torch.from_numpy(den_map.copy()).float().unsqueeze(0),
+            torch.from_numpy(img_attention_map.copy()).float().unsqueeze(0),
+        )
+        if points is not None:
+            return transformed + (points,)
+        return transformed
 
 
 class IDCIA(Dataset):
