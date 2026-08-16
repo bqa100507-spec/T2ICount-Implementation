@@ -1,6 +1,6 @@
 import argparse
 import torch
-from utils.regression_trainer import Reg_Trainer
+from utils.regression_trainer import Reg_Trainer, validate_train_sample_options
 from utils.paths import (
     AssetPaths,
     require_file,
@@ -42,6 +42,10 @@ def parse_arg():
                         help='the number of samples in a batch')
     parser.add_argument('--smoke-train-samples', default=0, type=int,
                         help='limit only the training split for infrastructure smoke tests; 0 disables')
+    parser.add_argument('--train-samples', default=0, type=int,
+                        help='randomly subset the training split; 0 uses the full split')
+    parser.add_argument('--train-subset-seed', default=3407, type=int,
+                        help='seed for deterministic training subset selection')
     parser.add_argument('--stride', default=384, type=int,
                         help='the stride for patchify')
     parser.add_argument('--beta', default=1e-4, type=float,
@@ -65,6 +69,7 @@ def parse_arg():
                         help='the number of epoch between validation')
 
     args = parser.parse_args()
+    validate_train_sample_options(args)
     return args
 
 

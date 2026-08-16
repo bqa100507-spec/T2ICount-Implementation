@@ -68,6 +68,14 @@ def train_collate(batch):
     return images, den, prompt, prompt_attn_mask, img_attn_mask
 
 
+def validate_train_sample_options(args):
+    if args.train_samples > 0 and args.smoke_train_samples > 0:
+        raise ValueError(
+            '--train-samples and --smoke-train-samples cannot be used '
+            'simultaneously.'
+        )
+
+
 def apply_smoke_train_sample_limit(datasets, sample_limit):
     if sample_limit > 0:
         train_dataset = datasets['train']
@@ -84,9 +92,29 @@ def apply_smoke_train_sample_limit(datasets, sample_limit):
     return datasets
 
 
+def apply_train_sample_subset(datasets, sample_limit, subset_seed):
+    if sample_limit > 0:
+        train_dataset = datasets['train']
+        effective_samples = min(sample_limit, len(train_dataset))
+        generator = torch.Generator()
+        generator.manual_seed(subset_seed)
+        indices = torch.randperm(
+            len(train_dataset), generator=generator
+        )[:effective_samples].tolist()
+        datasets['train'] = Subset(train_dataset, indices)
+        print(
+            'Training subset active: using {} of {} training samples '
+            'with subset seed {}.'.format(
+                effective_samples, len(train_dataset), subset_seed
+            )
+        )
+    return datasets
+
+
 class Reg_Trainer(Trainer):
     def setup(self):
         args = self.args
+        validate_train_sample_options(args)
         if args.seed != -1:
             setup_seed(args.seed)
             print('Random seed is set as {}'.format(args.seed))
@@ -121,6 +149,9 @@ class Reg_Trainer(Trainer):
                                         concat_size=args.concat_size,
                                         tokenizer=self.model.clip.tokenizer)
                          for x in ['train', 'val', 'test']}
+        apply_train_sample_subset(
+            self.datasets, args.train_samples, args.train_subset_seed
+        )
         apply_smoke_train_sample_limit(
             self.datasets, args.smoke_train_samples
         )
