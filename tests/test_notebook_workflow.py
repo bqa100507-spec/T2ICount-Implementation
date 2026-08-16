@@ -23,12 +23,15 @@ def _code_sources():
     ]
 
 
-def _find_code_cell(marker):
-    matches = [source for source in _code_sources() if marker in source]
+def _find_code_cell(*markers):
+    matches = [
+        source for source in _code_sources()
+        if all(marker in source for marker in markers)
+    ]
     if len(matches) != 1:
         raise AssertionError(
             'Expected one notebook code cell containing {!r}, found {}'.format(
-                marker, len(matches)
+                markers, len(matches)
             )
         )
     return matches[0]
@@ -70,7 +73,7 @@ class NotebookWorkflowTests(unittest.TestCase):
             self.assertIn('FAILED', source)
 
     def test_limited_compute_pilot_configuration_and_live_streaming(self):
-        source = _find_code_cell('baseline_500x10')
+        source = _find_code_cell('baseline_500x10', 'subprocess.Popen(')
 
         for expected in (
             'PILOT_BATCH_SIZE = 1',

@@ -19,16 +19,30 @@ LEGACY_NONPERSISTENT_BUFFER_KEYS = frozenset({
 })
 
 
-def _remove_legacy_nonpersistent_buffers(state_dict):
+def _reconcile_cross_version_nonpersistent_buffers(
+    state_dict, model_state_dict
+):
     removed = []
+    populated = []
     for key in LEGACY_NONPERSISTENT_BUFFER_KEYS:
-        if key in state_dict:
+        checkpoint_has_key = key in state_dict
+        model_has_key = key in model_state_dict
+        if checkpoint_has_key and not model_has_key:
             del state_dict[key]
             removed.append(key)
+        elif model_has_key and not checkpoint_has_key:
+            state_dict[key] = model_state_dict[key].detach().clone()
+            populated.append(key)
     if removed:
         print(
             "Removed legacy non-persistent checkpoint buffer(s): {}"
             .format(", ".join(sorted(removed)))
+        )
+    if populated:
+        print(
+            "Populated cross-version non-persistent checkpoint buffer(s) "
+            "from the current model: {}"
+            .format(", ".join(sorted(populated)))
         )
     return state_dict
 
@@ -40,7 +54,9 @@ def load_t2icount_checkpoint(model, checkpoint_path):
     )
     if isinstance(state, dict) and "model_state_dict" in state:
         state = state["model_state_dict"]
-    state = _remove_legacy_nonpersistent_buffers(state)
+    state = _reconcile_cross_version_nonpersistent_buffers(
+        state, model.state_dict()
+    )
     model.load_state_dict(state, strict=True)
     return model
 
