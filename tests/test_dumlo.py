@@ -20,6 +20,7 @@ class DUMLOCoreTests(unittest.TestCase):
         with mock.patch('sys.argv', ['train.py']):
             args = parse_arg()
         self.assertEqual(args.loss_mode, 'baseline')
+        self.assertEqual(args.dumlo_lambda_count, 1.0)
         self.assertEqual(args.dumlo_lambda_ot, 0.1)
         self.assertEqual(args.dumlo_lambda_tv, 0.01)
         self.assertEqual(args.dumlo_epsilon, 10.0)
@@ -27,6 +28,12 @@ class DUMLOCoreTests(unittest.TestCase):
         self.assertEqual(args.dumlo_aug_points, 10)
         self.assertEqual(args.dumlo_radius_factor, 0.5)
         self.assertEqual(args.dumlo_sampling_seed, 3407)
+
+    def test_cli_accepts_dumlo_count_weight(self):
+        with mock.patch(
+                'sys.argv', ['train.py', '--dumlo-lambda-count', '0.1']):
+            args = parse_arg()
+        self.assertEqual(args.dumlo_lambda_count, 0.1)
 
     def test_discrete_map_preserves_colliding_point_mass(self):
         points = torch.tensor([[1.0, 1.0], [1.5, 1.5], [7.9, 7.9]])
@@ -117,26 +124,49 @@ class DUMLOCoreTests(unittest.TestCase):
         self.assertLess(near_loss.item(), far_loss.item())
         self.assertFalse(torch.allclose(near_grad, far_grad))
 
-    def test_count_tv_and_total_composition(self):
+    def test_count_weight_defaults_to_previous_total_and_only_weights_count(self):
         pred_den = torch.zeros(1, 1, 2, 2, requires_grad=True)
         with torch.no_grad():
-            pred_den[0, 0, 0, 0] = 60.0
-            pred_den[0, 0, 1, 1] = 60.0
-        points = [torch.tensor([[1.0, 1.0], [7.0, 7.0]])]
-        criterion = DUMLOLoss(
+            pred_den[0, 0, 1, 1] = 120.0
+        points = [torch.tensor([[1.0, 1.0]])]
+        default_criterion = DUMLOLoss(
             lambda_ot=0.1, lambda_tv=0.01, num_iters=10,
             augmentation_points=0
         )
-        total, diagnostics = criterion(pred_den, points, 8, 8)
-        expected = (
-            diagnostics['count_loss']
-            + 0.1 * diagnostics['ot_loss']
-            + 0.01 * 2 * diagnostics['tv_loss']
+        weighted_criterion = DUMLOLoss(
+            lambda_count=0.1, lambda_ot=0.1, lambda_tv=0.01,
+            num_iters=10, augmentation_points=0
         )
-        self.assertAlmostEqual(diagnostics['count_loss'].item(), 0.0)
-        self.assertAlmostEqual(diagnostics['tv_loss'].item(), 0.0, places=6)
-        self.assertTrue(torch.allclose(total, expected))
-        total.backward()
+        default_total, default_diagnostics = default_criterion(
+            pred_den, points, 8, 8
+        )
+        weighted_total, weighted_diagnostics = weighted_criterion(
+            pred_den, points, 8, 8
+        )
+        previous_total = (
+            default_diagnostics['count_loss']
+            + 0.1 * default_diagnostics['ot_loss']
+            + 0.01 * default_diagnostics['tv_loss']
+        )
+        weighted_expected = (
+            0.1 * default_diagnostics['count_loss']
+            + 0.1 * default_diagnostics['ot_loss']
+            + 0.01 * default_diagnostics['tv_loss']
+        )
+        self.assertTrue(torch.equal(default_total, previous_total))
+        self.assertTrue(torch.equal(weighted_total, weighted_expected))
+        self.assertTrue(torch.equal(
+            weighted_diagnostics['count_loss'],
+            default_diagnostics['count_loss'],
+        ))
+        self.assertEqual(weighted_diagnostics['count_loss'].item(), 1.0)
+        self.assertTrue(torch.equal(
+            weighted_diagnostics['ot_loss'], default_diagnostics['ot_loss']
+        ))
+        self.assertTrue(torch.equal(
+            weighted_diagnostics['tv_loss'], default_diagnostics['tv_loss']
+        ))
+        default_total.backward()
         self.assertTrue(torch.isfinite(pred_den.grad).all())
 
     def test_count_and_tv_follow_predicted_distribution(self):

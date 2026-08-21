@@ -270,8 +270,9 @@ class DUMLOLoss(nn.Module):
     def __init__(self, lambda_ot=0.1, lambda_tv=0.01, epsilon=10.0,
                  num_iters=100, augmentation_points=10,
                  radius_factor=0.5, sampling_seed=3407,
-                 numerical_eps=1e-8):
+                 numerical_eps=1e-8, lambda_count=1.0):
         super(DUMLOLoss, self).__init__()
+        self.lambda_count = lambda_count
         self.lambda_ot = lambda_ot
         self.lambda_tv = lambda_tv
         self.epsilon = epsilon
@@ -342,7 +343,7 @@ class DUMLOLoss(nn.Module):
                 )
 
             total = (
-                count_loss
+                self.lambda_count * count_loss
                 + self.lambda_ot * ot_loss
                 + self.lambda_tv * float(gt_count) * tv_loss
             )

@@ -49,6 +49,8 @@ def parse_arg():
     parser.add_argument('--loss-mode', choices=('baseline', 'dumlo'),
                         default='baseline',
                         help='opt-in training regression loss')
+    parser.add_argument('--dumlo-lambda-count', default=1.0, type=float,
+                        help='DUMLO count-loss weight.')
     parser.add_argument('--dumlo-lambda-ot', default=0.1, type=float,
                         help='DUMLO optimal-transport loss weight')
     parser.add_argument('--dumlo-lambda-tv', default=0.01, type=float,

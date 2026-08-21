@@ -205,6 +205,7 @@ class Reg_Trainer(Trainer):
         self.dumlo_loss = None
         if args.loss_mode == 'dumlo':
             self.dumlo_loss = DUMLOLoss(
+                lambda_count=args.dumlo_lambda_count,
                 lambda_ot=args.dumlo_lambda_ot,
                 lambda_tv=args.dumlo_lambda_tv,
                 epsilon=args.dumlo_epsilon,
