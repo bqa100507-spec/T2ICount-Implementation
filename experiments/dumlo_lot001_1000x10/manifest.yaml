@@ -1,0 +1,51 @@
+name: dumlo_lot001_1000x10
+status: completed
+task: "Controlled FSC-147 DUMLO-based T2ICount lambda_ot ablation"
+branch: DUMLO
+commit: "8706cf712e79c43a338cbd37003a959f95bd631f"
+dirty: false
+date: null
+training:
+  samples: 1000
+  subset_seed: 3407
+  seed: 3407
+  epochs: 10
+  batch_size: 1
+  start_val: 7
+  val_epoch: 1
+loss:
+  mode: dumlo
+  dumlo:
+    lambda_count: 1.0
+    lambda_ot: 0.01
+    lambda_tv: 0.01
+    epsilon: 10
+    iters: 100
+    aug_points: 10
+    radius_factor: 0.5
+    sampling_seed: 3407
+invariants:
+  architecture: "Same T2ICount architecture across the four controlled runs"
+  rrc: "Same T2ICount RRC path across the four controlled runs"
+  optimizer: "Same T2ICount optimizer setup across the four controlled runs"
+  dataset_transforms: "Same dataset transforms; deterministic 1000-sample subset and seeds recorded above"
+  inference: "Same T2ICount inference path across the four controlled runs"
+artifacts:
+  checkpoint_dir: "/content/drive/MyDrive/T2ICount-assets/checkpoints/dumlo_retrain/lambda_ot_001_1000x10/dumlo_lot001_1000x10/"
+  best_checkpoint: "/content/drive/MyDrive/T2ICount-assets/checkpoints/dumlo_retrain/lambda_ot_001_1000x10/dumlo_lot001_1000x10/best_model_7.pth"
+  train_log: "/content/drive/MyDrive/T2ICount-assets/checkpoints/dumlo_retrain/lambda_ot_001_1000x10/dumlo_lot001_1000x10/train.log"
+  console_log: "/content/drive/MyDrive/T2ICount-assets/checkpoints/dumlo_retrain/lambda_ot_001_1000x10/dumlo_lot001_1000x10/console.log"
+results:
+  best_epoch: 7
+  val_mae: 51.33
+  val_rmse: 130.60
+  test_mae: 50.19
+  test_rmse: 153.73
+notes: >-
+  Current notebook output establishes the DUMLO checkout/pull, a clean status
+  before execution, the command, results, and console.log path. Current Git
+  history establishes the recorded branch tip used by that command. The saved
+  timestamps contain month and day (08-21) but no year, so date remains null.
+  best_model_7.pth and train.log follow tracked save conventions plus the logged
+  best epoch; their continued Drive existence was not checked. This is an
+  operational DUMLO-based T2ICount ablation, not a paper-exact claim.

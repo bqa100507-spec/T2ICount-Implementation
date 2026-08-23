@@ -72,37 +72,30 @@ class NotebookWorkflowTests(unittest.TestCase):
             self.assertIn('RETURN CODE:', source)
             self.assertIn('FAILED', source)
 
-    def test_limited_compute_pilot_configuration_and_live_streaming(self):
-        source = _find_code_cell('baseline_500x10', 'subprocess.Popen(')
+    def test_training_subprocess_streams_live_output_and_persists_status(self):
+        source = _find_code_cell('"train.py"', 'subprocess.Popen(')
 
         for expected in (
-            'PILOT_BATCH_SIZE = 1',
-            'TRAIN_SAMPLES = 500',
-            'TRAIN_SUBSET_SEED = 3407',
-            'EPOCHS = 10',
             '"-u"',
-            '"--train-samples", str(TRAIN_SAMPLES)',
-            '"--train-subset-seed", str(TRAIN_SUBSET_SEED)',
-            '"--epochs", str(EPOCHS)',
-            '"--start-val", "9"',
-            '"--val-epoch", "1"',
-            '"--seed", "3407"',
+            '"train.py"',
             'subprocess.Popen(',
+            '        cmd,',
             'stdout=subprocess.PIPE',
             'stderr=subprocess.STDOUT',
             'text=True',
-            'bufsize=1',
             'for line in process.stdout:',
             'print(line, end="", flush=True)',
+            'start = time.perf_counter()',
             'return_code = process.wait()',
+            'elapsed = time.perf_counter() - start',
             'RETURN CODE:',
-            'TOTAL TIME:',
-            'PASSED',
-            'FAILED',
+            'TOTAL TIME SEC:',
+            'TOTAL TIME MIN:',
+            'STATUS_FILE.write_text(status, encoding="utf-8")',
+            'print("\\n" + status)',
         ):
             self.assertIn(expected, source)
 
-        self.assertNotIn('--smoke-train-samples', source)
         self.assertNotIn('subprocess.run(', source)
 
     def test_notebook_declares_smoke_tests_disabled_by_default(self):

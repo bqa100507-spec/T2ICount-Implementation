@@ -1,0 +1,50 @@
+name: dumlo_lc01_1000x10
+status: completed
+task: "Controlled FSC-147 DUMLO-based T2ICount lambda_count ablation"
+branch: null
+commit: null
+dirty: null
+date: null
+training:
+  samples: 1000
+  subset_seed: 3407
+  seed: 3407
+  epochs: 10
+  batch_size: 1
+  start_val: 7
+  val_epoch: 1
+loss:
+  mode: dumlo
+  dumlo:
+    lambda_count: 0.1
+    lambda_ot: 0.1
+    lambda_tv: 0.01
+    epsilon: 10
+    iters: 100
+    aug_points: 10
+    radius_factor: 0.5
+    sampling_seed: 3407
+invariants:
+  architecture: "Same T2ICount architecture across the four controlled runs"
+  rrc: "Same T2ICount RRC path across the four controlled runs"
+  optimizer: "Same T2ICount optimizer setup across the four controlled runs"
+  dataset_transforms: "Same dataset transforms; deterministic 1000-sample subset and seeds recorded above"
+  inference: "Same T2ICount inference path across the four controlled runs"
+artifacts:
+  checkpoint_dir: "/content/drive/MyDrive/T2ICount-assets/checkpoints/dumlo_retrain/lambda_count_01_1000x10/dumlo_lc01_1000x10/"
+  best_checkpoint: "/content/drive/MyDrive/T2ICount-assets/checkpoints/dumlo_retrain/lambda_count_01_1000x10/dumlo_lc01_1000x10/best_model_7.pth"
+  train_log: "/content/drive/MyDrive/T2ICount-assets/checkpoints/dumlo_retrain/lambda_count_01_1000x10/dumlo_lc01_1000x10/train.log"
+  console_log: null
+results:
+  best_epoch: 7
+  val_mae: 38.16
+  val_rmse: 116.36
+  test_mae: 34.13
+  test_rmse: 139.89
+notes: >-
+  This is an operational DUMLO-based T2ICount ablation, not a paper-exact
+  claim. Original branch, commit, dirty state, date, and console-log filename
+  were not recoverable and remain null. best_model_7.pth and train.log follow
+  tracked save conventions plus the recorded best epoch; their continued Drive
+  existence was not checked.
+

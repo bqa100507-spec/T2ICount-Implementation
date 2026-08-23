@@ -1,0 +1,44 @@
+name: null
+status: null
+task: null
+branch: null
+commit: null
+dirty: null
+date: null
+training:
+  samples: null
+  subset_seed: null
+  seed: null
+  epochs: null
+  batch_size: null
+  start_val: null
+  val_epoch: null
+loss:
+  mode: null
+  dumlo:
+    lambda_count: null
+    lambda_ot: null
+    lambda_tv: null
+    epsilon: null
+    iters: null
+    aug_points: null
+    radius_factor: null
+    sampling_seed: null
+invariants:
+  architecture: null
+  rrc: null
+  optimizer: null
+  dataset_transforms: null
+  inference: null
+artifacts:
+  checkpoint_dir: null
+  best_checkpoint: null
+  train_log: null
+  console_log: null
+results:
+  best_epoch: null
+  val_mae: null
+  val_rmse: null
+  test_mae: null
+  test_rmse: null
+notes: null
