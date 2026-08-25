@@ -62,6 +62,13 @@ def parse_arg():
             'to DUMLO training'
         ),
     )
+    parser.add_argument(
+        '--dumlo-lambda-normalized-l1', default=0.0, type=float,
+        help=(
+            'optional weight for the original T2ICount normalized '
+            'density-map L1 component during DUMLO training'
+        ),
+    )
     parser.add_argument('--dumlo-epsilon', default=10.0, type=float,
                         help='DUMLO entropic regularization epsilon')
     parser.add_argument('--dumlo-iters', default=100, type=int,

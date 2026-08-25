@@ -76,7 +76,7 @@ def train_collate(batch):
 def compute_regression_loss(loss_mode, pred_den, gt_den_maps,
                             point_sets=None, dumlo_loss=None,
                             input_h=None, input_w=None, epoch=0, step=0,
-                            lambda_ssim=0.0):
+                            lambda_ssim=0.0, lambda_normalized_l1=0.0):
     if loss_mode == 'baseline':
         return get_reg_loss(
             pred_den, gt_den_maps, threshold=1e-3 * 60
@@ -88,15 +88,26 @@ def compute_regression_loss(loss_mode, pred_den, gt_den_maps,
             pred_den, point_sets, input_h=input_h, input_w=input_w,
             epoch=epoch, step=step,
         )
-        if lambda_ssim == 0.0:
+        if lambda_ssim == 0.0 and lambda_normalized_l1 == 0.0:
             return dumlo_result
         dumlo_total, diagnostics = dumlo_result
-        ssim_loss = get_ssim_loss(
-            pred_den, gt_den_maps, threshold=1e-3 * 60
-        )
         diagnostics = dict(diagnostics)
-        diagnostics['ssim_loss'] = ssim_loss
-        return dumlo_total + lambda_ssim * ssim_loss, diagnostics
+        if lambda_ssim != 0.0:
+            ssim_loss = get_ssim_loss(
+                pred_den, gt_den_maps, threshold=1e-3 * 60
+            )
+            dumlo_total = dumlo_total + lambda_ssim * ssim_loss
+            diagnostics['ssim_loss'] = ssim_loss
+        if lambda_normalized_l1 != 0.0:
+            normalized_l1_loss = get_normalized_l1_loss(
+                pred_den, gt_den_maps
+            )
+            dumlo_total = (
+                dumlo_total
+                + lambda_normalized_l1 * normalized_l1_loss
+            )
+            diagnostics['normalized_l1_loss'] = normalized_l1_loss
+        return dumlo_total, diagnostics
     raise ValueError('unsupported loss mode: {}'.format(loss_mode))
 
 
@@ -229,6 +240,11 @@ class Reg_Trainer(Trainer):
                     'DUMLO SSIM-only coefficient: %s',
                     args.dumlo_lambda_ssim,
                 )
+            if args.dumlo_lambda_normalized_l1 != 0.0:
+                logging.info(
+                    'DUMLO normalized-L1 coefficient: %s',
+                    args.dumlo_lambda_normalized_l1,
+                )
 
         self.start_epoch = args.start_epoch
         self.best_mae = np.inf
@@ -302,6 +318,8 @@ class Reg_Trainer(Trainer):
             epoch_signed_error = AverageMeter()
             if self.args.dumlo_lambda_ssim != 0.0:
                 epoch_ssim_loss = AverageMeter()
+            if self.args.dumlo_lambda_normalized_l1 != 0.0:
+                epoch_normalized_l1_loss = AverageMeter()
         epoch_start = time.time()
 
         train_dataloader = self.dataloaders['train']
@@ -336,6 +354,9 @@ class Reg_Trainer(Trainer):
                     epoch=self.epoch,
                     step=step,
                     lambda_ssim=self.args.dumlo_lambda_ssim,
+                    lambda_normalized_l1=(
+                        self.args.dumlo_lambda_normalized_l1
+                    ),
                 )
                 P = gt_den_maps >= (1e-3 * 60)
                 rrc_loss_stage1 = RRC_loss(sim_x2, AN, P)
@@ -367,6 +388,12 @@ class Reg_Trainer(Trainer):
                     if self.args.dumlo_lambda_ssim != 0.0:
                         epoch_ssim_loss.update(
                             dumlo_diagnostics['ssim_loss'].item(), N
+                        )
+                    if self.args.dumlo_lambda_normalized_l1 != 0.0:
+                        epoch_normalized_l1_loss.update(
+                            dumlo_diagnostics[
+                                'normalized_l1_loss'
+                            ].item(), N
                         )
 
                 if point_sets is None:
@@ -406,6 +433,10 @@ class Reg_Trainer(Trainer):
                             postfix['ssim'] = '{:.4f}'.format(
                                 epoch_ssim_loss.getAvg()
                             )
+                        if self.args.dumlo_lambda_normalized_l1 != 0.0:
+                            postfix['norm_l1'] = '{:.4f}'.format(
+                                epoch_normalized_l1_loss.getAvg()
+                            )
                         train_progress.set_postfix(
                             postfix, refresh=False
                         )
@@ -435,6 +466,10 @@ class Reg_Trainer(Trainer):
             )
             if self.args.dumlo_lambda_ssim != 0.0:
                 message += ', ssim:{:.4f}'.format(epoch_ssim_loss.getAvg())
+            if self.args.dumlo_lambda_normalized_l1 != 0.0:
+                message += ', norm_l1:{:.4f}'.format(
+                    epoch_normalized_l1_loss.getAvg()
+                )
             logging.info(
                 message + ', Cost: {:.1f} sec '.format(
                     time.time() - epoch_start
@@ -510,14 +545,24 @@ def get_ssim_loss(pred, gt, threshold, level=3, window_size=3):
                            window_size=window_size)
 
 
+def get_normalized_l1_loss(pred, gt):
+    mu_normed = get_normalized_map(pred)
+    gt_mu_normed = get_normalized_map(gt)
+    return (
+        nn.L1Loss(reduction='none')(mu_normed, gt_mu_normed)
+        .sum(1)
+        .sum(1)
+        .sum(1)
+        .mean(0)
+    )
+
+
 def get_reg_loss(pred, gt, threshold, level=3, window_size=3):
     loss_ssim = get_ssim_loss(
         pred, gt, threshold, level=level, window_size=window_size
     )
-    mu_normed = get_normalized_map(pred)
-    gt_mu_normed = get_normalized_map(gt)
-    tv_loss = (nn.L1Loss(reduction='none')(mu_normed, gt_mu_normed).sum(1).sum(1).sum(1)).mean(0)
-    return loss_ssim + 0.1 * tv_loss
+    normalized_l1_loss = get_normalized_l1_loss(pred, gt)
+    return loss_ssim + 0.1 * normalized_l1_loss
 
 
 def RRC_loss(simi, ambiguous_negative_map, positive_map):

@@ -14,6 +14,7 @@ from losses.dumlo import (
 from train import parse_arg
 from utils.regression_trainer import (
     compute_regression_loss,
+    get_normalized_l1_loss,
     get_normalized_map,
     get_reg_loss,
     get_ssim_loss,
@@ -29,6 +30,7 @@ class DUMLOCoreTests(unittest.TestCase):
         self.assertEqual(args.dumlo_lambda_ot, 0.1)
         self.assertEqual(args.dumlo_lambda_tv, 0.01)
         self.assertEqual(args.dumlo_lambda_ssim, 0.0)
+        self.assertEqual(args.dumlo_lambda_normalized_l1, 0.0)
         self.assertEqual(args.dumlo_epsilon, 10.0)
         self.assertEqual(args.dumlo_iters, 100)
         self.assertEqual(args.dumlo_aug_points, 10)
@@ -46,6 +48,14 @@ class DUMLOCoreTests(unittest.TestCase):
                 'sys.argv', ['train.py', '--dumlo-lambda-ssim', '0.25']):
             args = parse_arg()
         self.assertEqual(args.dumlo_lambda_ssim, 0.25)
+
+    def test_cli_accepts_dumlo_normalized_l1_weight(self):
+        with mock.patch(
+                'sys.argv', [
+                    'train.py', '--dumlo-lambda-normalized-l1', '0.1'
+                ]):
+            args = parse_arg()
+        self.assertEqual(args.dumlo_lambda_normalized_l1, 0.1)
 
     def test_discrete_map_preserves_colliding_point_mass(self):
         points = torch.tensor([[1.0, 1.0], [1.5, 1.5], [7.9, 7.9]])
@@ -226,14 +236,28 @@ class DUMLOCoreTests(unittest.TestCase):
         gt = torch.rand(1, 1, 8, 8)
         threshold = 1e-3 * 60
         ssim_loss = get_ssim_loss(pred, gt, threshold=threshold)
-        normalized_l1 = torch.nn.L1Loss(reduction='none')(
-            get_normalized_map(pred), get_normalized_map(gt)
-        ).sum(1).sum(1).sum(1).mean(0)
+        normalized_l1 = get_normalized_l1_loss(pred, gt)
         expected = ssim_loss + 0.1 * normalized_l1
         actual = get_reg_loss(pred, gt, threshold=threshold)
-        self.assertTrue(torch.allclose(actual, expected, atol=1e-7, rtol=1e-6))
+        self.assertTrue(torch.equal(actual, expected))
 
-    def test_zero_ssim_weight_returns_original_dumlo_without_ssim(self):
+    def test_normalized_l1_helper_matches_original_calculation(self):
+        torch.manual_seed(11)
+        pred = torch.rand(2, 1, 4, 4)
+        gt = torch.rand(2, 1, 4, 4)
+        mu_normed = get_normalized_map(pred)
+        gt_mu_normed = get_normalized_map(gt)
+        expected = (
+            torch.nn.L1Loss(reduction='none')(mu_normed, gt_mu_normed)
+            .sum(1)
+            .sum(1)
+            .sum(1)
+            .mean(0)
+        )
+        actual = get_normalized_l1_loss(pred, gt)
+        self.assertTrue(torch.equal(actual, expected))
+
+    def test_zero_auxiliary_weights_return_original_dumlo(self):
         pred = torch.rand(1, 1, 4, 4)
         gt = torch.rand(1, 1, 4, 4)
         original_total = torch.tensor(0.75)
@@ -243,7 +267,12 @@ class DUMLOCoreTests(unittest.TestCase):
         )
         with mock.patch(
                 'utils.regression_trainer.get_ssim_loss',
-                side_effect=AssertionError('SSIM must not be computed')):
+                side_effect=AssertionError('SSIM must not be computed')), \
+                mock.patch(
+                    'utils.regression_trainer.get_normalized_l1_loss',
+                    side_effect=AssertionError(
+                        'normalized L1 must not be computed'
+                    )):
             total, diagnostics = compute_regression_loss(
                 'dumlo', pred, gt,
                 point_sets=[torch.empty(0, 2)],
@@ -251,10 +280,12 @@ class DUMLOCoreTests(unittest.TestCase):
                 input_h=16,
                 input_w=16,
                 lambda_ssim=0.0,
+                lambda_normalized_l1=0.0,
             )
         self.assertIs(total, original_total)
         self.assertIs(diagnostics, original_diagnostics)
         self.assertNotIn('ssim_loss', diagnostics)
+        self.assertNotIn('normalized_l1_loss', diagnostics)
 
     def test_unit_ssim_weight_adds_raw_ssim_only(self):
         pred = torch.rand(1, 1, 4, 4)
@@ -266,15 +297,22 @@ class DUMLOCoreTests(unittest.TestCase):
                 'utils.regression_trainer.get_ssim_loss',
                 return_value=raw_ssim) as ssim_mock, mock.patch(
                 'utils.regression_trainer.get_reg_loss',
-                side_effect=AssertionError('full regression loss not allowed')):
+                side_effect=AssertionError('full regression loss not allowed')), \
+                mock.patch(
+                    'utils.regression_trainer.get_normalized_l1_loss',
+                    side_effect=AssertionError(
+                        'normalized L1 must not be computed'
+                    )):
             total, diagnostics = compute_regression_loss(
                 'dumlo', pred, gt,
                 point_sets=[torch.empty(0, 2)],
                 dumlo_loss=criterion,
                 lambda_ssim=1.0,
+                lambda_normalized_l1=0.0,
             )
         self.assertTrue(torch.equal(total, dumlo_total + raw_ssim))
         self.assertIs(diagnostics['ssim_loss'], raw_ssim)
+        self.assertNotIn('normalized_l1_loss', diagnostics)
         ssim_mock.assert_called_once_with(pred, gt, threshold=1e-3 * 60)
 
     def test_nonunit_ssim_weight_scales_only_ssim_contribution(self):
@@ -294,6 +332,61 @@ class DUMLOCoreTests(unittest.TestCase):
             )
         self.assertTrue(torch.equal(total, dumlo_total + 0.25 * raw_ssim))
         self.assertIs(diagnostics['ssim_loss'], raw_ssim)
+
+    def test_full_reg_weights_add_raw_components_independently(self):
+        pred = torch.rand(1, 1, 4, 4)
+        gt = torch.rand(1, 1, 4, 4)
+        dumlo_total = torch.tensor(0.75)
+        raw_ssim = torch.tensor(0.4)
+        raw_normalized_l1 = torch.tensor(0.8)
+        criterion = mock.Mock(return_value=(dumlo_total, {}))
+        with mock.patch(
+                'utils.regression_trainer.get_ssim_loss',
+                return_value=raw_ssim), mock.patch(
+                'utils.regression_trainer.get_normalized_l1_loss',
+                return_value=raw_normalized_l1), mock.patch(
+                'utils.regression_trainer.get_reg_loss',
+                side_effect=AssertionError('full regression loss not allowed')):
+            total, diagnostics = compute_regression_loss(
+                'dumlo', pred, gt,
+                point_sets=[torch.empty(0, 2)],
+                dumlo_loss=criterion,
+                lambda_ssim=1.0,
+                lambda_normalized_l1=0.1,
+            )
+        expected = dumlo_total + raw_ssim + 0.1 * raw_normalized_l1
+        self.assertTrue(torch.equal(total, expected))
+        self.assertIs(diagnostics['ssim_loss'], raw_ssim)
+        self.assertIs(
+            diagnostics['normalized_l1_loss'], raw_normalized_l1
+        )
+
+    def test_nonunit_normalized_l1_weight_scales_only_its_contribution(self):
+        pred = torch.rand(1, 1, 4, 4)
+        gt = torch.rand(1, 1, 4, 4)
+        dumlo_total = torch.tensor(0.75)
+        raw_normalized_l1 = torch.tensor(0.8)
+        criterion = mock.Mock(return_value=(dumlo_total, {}))
+        with mock.patch(
+                'utils.regression_trainer.get_ssim_loss',
+                side_effect=AssertionError('SSIM must not be computed')), \
+                mock.patch(
+                    'utils.regression_trainer.get_normalized_l1_loss',
+                    return_value=raw_normalized_l1):
+            total, diagnostics = compute_regression_loss(
+                'dumlo', pred, gt,
+                point_sets=[torch.empty(0, 2)],
+                dumlo_loss=criterion,
+                lambda_ssim=0.0,
+                lambda_normalized_l1=0.25,
+            )
+        self.assertTrue(torch.equal(
+            total, dumlo_total + 0.25 * raw_normalized_l1
+        ))
+        self.assertIs(
+            diagnostics['normalized_l1_loss'], raw_normalized_l1
+        )
+        self.assertNotIn('ssim_loss', diagnostics)
 
     def test_dumlo_loss_has_no_model_parameters(self):
         self.assertEqual(list(DUMLOLoss().parameters()), [])
