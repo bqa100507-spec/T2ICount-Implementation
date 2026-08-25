@@ -75,7 +75,8 @@ def train_collate(batch):
 
 def compute_regression_loss(loss_mode, pred_den, gt_den_maps,
                             point_sets=None, dumlo_loss=None,
-                            input_h=None, input_w=None, epoch=0, step=0):
+                            input_h=None, input_w=None, epoch=0, step=0,
+                            lambda_ssim=0.0):
     if loss_mode == 'baseline':
         return get_reg_loss(
             pred_den, gt_den_maps, threshold=1e-3 * 60
@@ -83,10 +84,19 @@ def compute_regression_loss(loss_mode, pred_den, gt_den_maps,
     if loss_mode == 'dumlo':
         if dumlo_loss is None or point_sets is None:
             raise ValueError('DUMLO mode requires DUMLOLoss and point sets')
-        return dumlo_loss(
+        dumlo_result = dumlo_loss(
             pred_den, point_sets, input_h=input_h, input_w=input_w,
             epoch=epoch, step=step,
         )
+        if lambda_ssim == 0.0:
+            return dumlo_result
+        dumlo_total, diagnostics = dumlo_result
+        ssim_loss = get_ssim_loss(
+            pred_den, gt_den_maps, threshold=1e-3 * 60
+        )
+        diagnostics = dict(diagnostics)
+        diagnostics['ssim_loss'] = ssim_loss
+        return dumlo_total + lambda_ssim * ssim_loss, diagnostics
     raise ValueError('unsupported loss mode: {}'.format(loss_mode))
 
 
@@ -214,6 +224,11 @@ class Reg_Trainer(Trainer):
                 radius_factor=args.dumlo_radius_factor,
                 sampling_seed=args.dumlo_sampling_seed,
             )
+            if args.dumlo_lambda_ssim != 0.0:
+                logging.info(
+                    'DUMLO SSIM-only coefficient: %s',
+                    args.dumlo_lambda_ssim,
+                )
 
         self.start_epoch = args.start_epoch
         self.best_mae = np.inf
@@ -285,6 +300,8 @@ class Reg_Trainer(Trainer):
             epoch_tv_loss = AverageMeter()
             epoch_pred_count = AverageMeter()
             epoch_signed_error = AverageMeter()
+            if self.args.dumlo_lambda_ssim != 0.0:
+                epoch_ssim_loss = AverageMeter()
         epoch_start = time.time()
 
         train_dataloader = self.dataloaders['train']
@@ -318,6 +335,7 @@ class Reg_Trainer(Trainer):
                     input_w=self.args.crop_size,
                     epoch=self.epoch,
                     step=step,
+                    lambda_ssim=self.args.dumlo_lambda_ssim,
                 )
                 P = gt_den_maps >= (1e-3 * 60)
                 rrc_loss_stage1 = RRC_loss(sim_x2, AN, P)
@@ -346,6 +364,10 @@ class Reg_Trainer(Trainer):
                             'mean_signed_count_error'
                         ].item(), N
                     )
+                    if self.args.dumlo_lambda_ssim != 0.0:
+                        epoch_ssim_loss.update(
+                            dumlo_diagnostics['ssim_loss'].item(), N
+                        )
 
                 if point_sets is None:
                     gt_counts = torch.sum(gt_den_maps.view(N, -1), dim=1).detach().cpu().numpy() / 60
@@ -369,7 +391,7 @@ class Reg_Trainer(Trainer):
                     or completed_steps == len(train_dataloader)
                 ):
                     if self.args.loss_mode == 'dumlo':
-                        train_progress.set_postfix(
+                        postfix = dict(
                             reg='{:.4f}'.format(epoch_reg_loss.getAvg()),
                             rrc1='{:.4f}'.format(epoch_RRC1_loss.getAvg()),
                             rrc2='{:.4f}'.format(epoch_RRC2_loss.getAvg()),
@@ -379,7 +401,13 @@ class Reg_Trainer(Trainer):
                             tv='{:.4f}'.format(epoch_tv_loss.getAvg()),
                             pred_count='{:.2f}'.format(epoch_pred_count.getAvg()),
                             signed_error='{:.2f}'.format(epoch_signed_error.getAvg()),
-                            refresh=False,
+                        )
+                        if self.args.dumlo_lambda_ssim != 0.0:
+                            postfix['ssim'] = '{:.4f}'.format(
+                                epoch_ssim_loss.getAvg()
+                            )
+                        train_progress.set_postfix(
+                            postfix, refresh=False
                         )
                     else:
                         train_progress.set_postfix(
@@ -391,11 +419,11 @@ class Reg_Trainer(Trainer):
                         )
 
         if self.args.loss_mode == 'dumlo':
-            logging.info(
+            message = (
                 'Epoch {} Train, reg:{:.4f}, RRC_stage1:{:.4f}, '
                 'RRC_stage2:{:.4f}, mae:{:.2f}, mse:{:.2f}, count:{:.4f}, '
                 'ot:{:.4f}, tv:{:.4f}, pred_count:{:.2f}, '
-                'signed_error:{:.2f}, Cost: {:.1f} sec '
+                'signed_error:{:.2f}'
                 .format(
                     self.epoch, epoch_reg_loss.getAvg(),
                     epoch_RRC1_loss.getAvg(), epoch_RRC2_loss.getAvg(),
@@ -403,7 +431,13 @@ class Reg_Trainer(Trainer):
                     epoch_count_loss.getAvg(), epoch_ot_loss.getAvg(),
                     epoch_tv_loss.getAvg(), epoch_pred_count.getAvg(),
                     epoch_signed_error.getAvg(),
-                    (time.time() - epoch_start),
+                )
+            )
+            if self.args.dumlo_lambda_ssim != 0.0:
+                message += ', ssim:{:.4f}'.format(epoch_ssim_loss.getAvg())
+            logging.info(
+                message + ', Cost: {:.1f} sec '.format(
+                    time.time() - epoch_start
                 )
             )
         else:
@@ -470,10 +504,16 @@ def get_normalized_map(density_map):
     return mu_normed
 
 
-def get_reg_loss(pred, gt, threshold, level=3, window_size=3):
+def get_ssim_loss(pred, gt, threshold, level=3, window_size=3):
     mask = gt > threshold
-    loss_ssim = cal_avg_ms_ssim(pred * mask, gt * mask, level=level,
-                                window_size=window_size)
+    return cal_avg_ms_ssim(pred * mask, gt * mask, level=level,
+                           window_size=window_size)
+
+
+def get_reg_loss(pred, gt, threshold, level=3, window_size=3):
+    loss_ssim = get_ssim_loss(
+        pred, gt, threshold, level=level, window_size=window_size
+    )
     mu_normed = get_normalized_map(pred)
     gt_mu_normed = get_normalized_map(gt)
     tv_loss = (nn.L1Loss(reduction='none')(mu_normed, gt_mu_normed).sum(1).sum(1).sum(1)).mean(0)

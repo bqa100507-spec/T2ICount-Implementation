@@ -55,6 +55,13 @@ def parse_arg():
                         help='DUMLO optimal-transport loss weight')
     parser.add_argument('--dumlo-lambda-tv', default=0.01, type=float,
                         help='DUMLO total-variation loss weight')
+    parser.add_argument(
+        '--dumlo-lambda-ssim', default=0.0, type=float,
+        help=(
+            'weight for adding only the original T2ICount SSIM component '
+            'to DUMLO training'
+        ),
+    )
     parser.add_argument('--dumlo-epsilon', default=10.0, type=float,
                         help='DUMLO entropic regularization epsilon')
     parser.add_argument('--dumlo-iters', default=100, type=int,

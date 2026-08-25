@@ -19,6 +19,7 @@ loss:
     lambda_count: null
     lambda_ot: null
     lambda_tv: null
+    lambda_ssim: null
     epsilon: null
     iters: null
     aug_points: null
