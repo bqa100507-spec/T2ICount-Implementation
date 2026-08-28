@@ -117,6 +117,7 @@ class RichPromptGeneratorTests(unittest.TestCase):
 
         self.assertIn('The target category is: "Stew pot".', prompt)
         self.assertIn('exact category name "Stew pot" verbatim', prompt)
+        self.assertIn("Do not state or imply how many", prompt)
         self.assertEqual(prompt.count("Stew pot"), 2)
 
     def test_interactions_request_has_exact_model_text_and_image_payload(self):
@@ -153,6 +154,14 @@ class RichPromptGeneratorTests(unittest.TestCase):
 
         self.assertEqual(metadata["generator"], "gemini-3.6-flash")
         self.assertEqual(metadata["api"], "interactions")
+        self.assertEqual(metadata["protocol_version"], "rich-prompt-phase1-v2")
+        self.assertEqual(
+            metadata["generalization_rule"],
+            (
+                "case-insensitive exact class replacement: singular-like class "
+                "-> target object; plural-like class -> target objects"
+            ),
+        )
 
     def test_missing_api_key_fails_before_client_creation(self):
         factory = mock.Mock()
@@ -243,6 +252,47 @@ class RichPromptGeneratorTests(unittest.TestCase):
                     "Stew pot",
                 )
 
+    def test_indefinite_article_and_individual_cues_are_rejected(self):
+        for description in (
+            "The people include a dark-haired individual near the peppers.",
+            "The people include an isolated individual near the doorway.",
+        ):
+            with self.subTest(description=description), self.assertRaisesRegex(
+                rich.DescriptionValidationError,
+                "implicit count leakage",
+            ):
+                rich.validate_detailed_description(description, "people")
+
+    def test_implicit_instance_count_terms_are_rejected(self):
+        for term in (
+            "single",
+            "pair",
+            "couple",
+            "group",
+            "crowd",
+            "cluster",
+        ):
+            with self.subTest(term=term), self.assertRaisesRegex(
+                rich.DescriptionValidationError,
+                "implicit count leakage: {}".format(term),
+            ):
+                rich.validate_detailed_description(
+                    "The people appear as {} silhouettes near the doorway."
+                    .format(term),
+                    "people",
+                )
+
+    def test_implicit_leakage_matching_respects_word_boundaries(self):
+        detailed = rich.validate_detailed_description(
+            "The Spatula shows metal, handle contours, and orange coloring.",
+            "Spatula",
+        )
+
+        self.assertEqual(
+            detailed,
+            "The Spatula shows metal, handle contours, and orange coloring.",
+        )
+
     def test_missing_target_class_is_rejected(self):
         with self.assertRaisesRegex(
             rich.DescriptionValidationError,
@@ -276,9 +326,38 @@ class RichPromptGeneratorTests(unittest.TestCase):
 
         self.assertEqual(
             first,
-            "The object is dark and the object has curved handles.",
+            (
+                "The target object is dark and the target object has curved "
+                "handles."
+            ),
         )
         self.assertEqual(first, second)
+
+    def test_generalization_uses_plurality_aware_target_phrase(self):
+        cases = (
+            ("Spatula", "The Spatula is metallic.", "The target object is metallic."),
+            (
+                "Stew pot",
+                "The Stew pot has steel surfaces.",
+                "The target object has steel surfaces.",
+            ),
+            (
+                "people",
+                "The people have dark clothing.",
+                "The target objects have dark clothing.",
+            ),
+            (
+                "strawberries",
+                "The strawberries have red surfaces.",
+                "The target objects have red surfaces.",
+            ),
+        )
+        for class_name, detailed, expected in cases:
+            with self.subTest(class_name=class_name):
+                self.assertEqual(
+                    rich.generalize_description(detailed, class_name),
+                    expected,
+                )
 
     def test_generalization_replacement_is_case_insensitive(self):
         self.assertEqual(
@@ -286,8 +365,21 @@ class RichPromptGeneratorTests(unittest.TestCase):
                 "The STEW POT is dark and round.",
                 "Stew pot",
             ),
-            "The object is dark and round.",
+            "The target object is dark and round.",
         )
+
+    def test_v1_prompt_bank_is_rejected_by_v2_compatibility_check(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_path = Path(temp_dir) / "v1-bank.json"
+            bank = rich.new_prompt_bank("2026-08-28T00:00:00Z")
+            bank["metadata"]["protocol_version"] = "rich-prompt-phase1-v1"
+            rich.atomic_save_prompt_bank(bank, output_path)
+
+            with self.assertRaisesRegex(
+                rich.PromptBankError,
+                "incompatible protocol_version",
+            ):
+                rich.load_prompt_bank(output_path)
 
     def test_resume_skips_successful_entry(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -298,7 +390,7 @@ class RichPromptGeneratorTests(unittest.TestCase):
             bank["prompts"]["20.jpg"] = {
                 "class": "Stew pot",
                 "detailed": "The Stew pot is dark and round.",
-                "generalized": "The object is dark and round.",
+                "generalized": "The target object is dark and round.",
                 "status": "ok",
                 "attempts": 1,
             }
@@ -319,7 +411,7 @@ class RichPromptGeneratorTests(unittest.TestCase):
             bank["prompts"]["20.jpg"] = {
                 "class": "Stew pot",
                 "detailed": "The Stew pot was previously described.",
-                "generalized": "The object was previously described.",
+                "generalized": "The target object was previously described.",
                 "status": "ok",
                 "attempts": 1,
             }
@@ -334,6 +426,25 @@ class RichPromptGeneratorTests(unittest.TestCase):
             self.assertEqual(summary.generated, 1)
             self.assertEqual(len(client.calls), 1)
             self.assertIn("glossy", saved["prompts"]["20.jpg"]["detailed"])
+
+    def test_generalization_introduces_no_second_gemini_request(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            asset_root, metadata_path = _create_fixture(root)
+            config = _config(root, asset_root, metadata_path)
+            client = _FakeClient(
+                ["The Stew pot has glossy steel surfaces and curved handles."]
+            )
+
+            summary = rich.run_generation(config, client=client, emit=lambda _: None)
+            saved = json.loads(config.output_path.read_text(encoding="utf-8"))
+
+            self.assertEqual(summary.generated, 1)
+            self.assertEqual(len(client.calls), 1)
+            self.assertEqual(
+                saved["prompts"]["20.jpg"]["generalized"],
+                "The target object has glossy steel surfaces and curved handles.",
+            )
 
     def test_failed_generation_never_creates_fallback_prompt(self):
         with tempfile.TemporaryDirectory() as temp_dir:

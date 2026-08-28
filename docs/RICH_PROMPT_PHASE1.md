@@ -12,11 +12,26 @@ output contains:
 
 - `detailed`: Gemini's one-sentence response after whitespace cleanup only.
 - `generalized`: the detailed response with every case-insensitive exact class
-  occurrence replaced deterministically by `object`.
+  occurrence replaced deterministically by `target object` or `target objects`.
 
 The RichCount paper used GPT-4. This protocol is inspired by RichCount, but it
 is not an exact RichCount reproduction: Phase 1A uses Gemini 3.6 Flash and this
 repository's fixed description protocol.
+
+## Why protocol v2 exists
+
+The initial three-image Gemini 3.6 pilot exposed an implicit count cue that the
+v1 validator did not catch. For the `people` class, the generated wording
+included `a ... individual`, which implies one visible target instance without
+using a digit or number word. The same pilot showed that replacing a plural
+class with plain `object` could produce awkward wording such as `The object ...
+consist`.
+
+Protocol `rich-prompt-phase1-v2` is this experiment's refinement, not a
+requirement taken from the RichCount paper. It strengthens the fixed generation
+prompt against implicit instance cues, adds a conservative implicit-leakage
+validator, and makes deterministic generalization plurality-aware. The Gemini
+model and Interactions API transport are unchanged.
 
 ## Why prompts are generated once
 
@@ -34,13 +49,25 @@ response objects, chain-of-thought, or image bytes.
 The generator rejects empty or multiline responses, responses that are clearly
 more than one sentence, missing exact class names, digits, English number words
 from zero through twenty, hundred/thousand, and the documented quantity terms in
-`COUNT_LEAKAGE_TERMS`. Validation failures are regenerated within the configured
-retry limit. A sample that still fails is written only to the bank's `failures`
-object; it never receives a fabricated fallback prompt.
+`COUNT_LEAKAGE_TERMS`. Protocol v2 also rejects the standalone tokens in
+`IMPLICIT_COUNT_LEAKAGE_TERMS`, including `a`, `an`, `single`, `individual`,
+`pair`, `couple`, `group`, `crowd`, and `cluster` plus documented plural forms.
 
-Generalization makes no second API request and performs no paraphrasing. If the
-exact class cannot be found case-insensitively, validation fails instead of
-inventing generalized text.
+The implicit filter is deliberately conservative for this pilot: even an
+indefinite article used for scene context is rejected because it can imply an
+instance count. Matching uses word boundaries, so substrings inside words such
+as `metal`, `handle`, and `orange` are not rejected. Validation failures retain
+the existing retry behavior. A sample that still fails is written only to the
+bank's `failures` object; it never receives a fabricated fallback prompt.
+
+Generalization makes no second API request and performs no paraphrasing. The v2
+heuristic treats `people` and classes whose normalized names end in `s` as
+plural-like, replacing them with `target objects`; all other classes become
+`target object`. Replacement remains case-insensitive and exact. This small
+heuristic intentionally avoids an NLP dependency, so singular words ending in
+`s` can be classified as plural-like and irregular plurals other than `people`
+can be classified as singular-like. If the exact class cannot be found,
+validation fails instead of inventing generalized text.
 
 ## Environment and API key
 
@@ -113,9 +140,9 @@ successful entries. An interrupted run therefore does not require regenerating
 the whole benchmark.
 
 The tool refuses to append to a bank whose generator, API transport, protocol,
-template, or generalization rule differs from the current constants. This
-prevents silently mixing Gemini 2.5/Generate Content output with Gemini
-3.6/Interactions output.
+template, or generalization rule differs from the current constants. In
+particular, a v2 run cannot append to a v1 prompt bank, preventing the two
+generation/validation/generalization protocols from being silently mixed.
 
 ## Intentionally deferred
 

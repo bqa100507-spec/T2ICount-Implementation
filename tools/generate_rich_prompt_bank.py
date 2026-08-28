@@ -22,26 +22,37 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 BENCHMARK = "FSC-147-S"
 MODEL_NAME = "gemini-3.6-flash"
 API_NAME = "interactions"
-PROTOCOL_VERSION = "rich-prompt-phase1-v1"
-GENERALIZATION_RULE = "case-insensitive target class -> object"
+PROTOCOL_VERSION = "rich-prompt-phase1-v2"
+GENERALIZATION_RULE = (
+    "case-insensitive exact class replacement: singular-like class -> "
+    "target object; plural-like class -> target objects"
+)
 ASSET_ROOT_ENV = "T2ICOUNT_ASSET_ROOT"
 API_KEY_ENV = "GEMINI_API_KEY"
 
 GENERATION_PROMPT_TEMPLATE = '''The target category is: "{class_name}".
 
-Describe the target category in this image in one concise sentence.
+Describe the visual appearance and scene context of the target category
+in this image in one concise sentence.
 
-Focus only on visual information useful for identifying the target,
-such as appearance, color, shape, state, arrangement, and location.
+Focus only on information useful for identifying the target, such as:
+- appearance
+- color
+- shape
+- material or state
+- spatial arrangement
+- location in the scene
 
 Requirements:
 - Include the exact category name "{class_name}" verbatim.
 - Do not count the targets.
-- Do not mention numbers or quantities.
-- Do not use quantity words such as many, several, few, numerous,
-  dozens, or a pair.
-- Do not describe unrelated objects unless needed to specify the
-  target's location.
+- Do not state or imply how many target instances are visible.
+- Do not use digits, number words, or quantity words.
+- Avoid instance-count cues such as a, an, single, individual, pair,
+  pairs, couple, group, crowd, or cluster.
+- Describe the target category rather than narrating one particular instance.
+- Do not describe unrelated objects unless needed to identify the target's
+  location.
 - Output exactly one sentence and nothing else.'''
 
 # Auditable count-leakage vocabulary. Multi-word expressions and whole words
@@ -77,18 +88,39 @@ COUNT_LEAKAGE_TERMS = (
     "numerous",
     "dozen",
     "dozens",
-    "pair",
-    "pairs",
-    "couple",
     "multiple",
     "both",
-    "single",
     "double",
     "triple",
     "a lot",
     "lots",
     "a number of",
 )
+
+# Deliberately conservative pilot filter for implicit instance-count cues.
+# Matching is token/word-boundary-aware, so article tokens such as ``a`` and
+# ``an`` are rejected without matching the same letters inside other words.
+IMPLICIT_COUNT_LEAKAGE_TERMS = (
+    "a",
+    "an",
+    "single",
+    "individual",
+    "individuals",
+    "pair",
+    "pairs",
+    "couple",
+    "couples",
+    "group",
+    "groups",
+    "crowd",
+    "crowds",
+    "cluster",
+    "clusters",
+)
+
+# Small deterministic plurality heuristic. It intentionally avoids an NLP
+# dependency; known false classifications are documented with the protocol.
+IRREGULAR_PLURAL_LIKE_CLASSES = frozenset(("people",))
 
 SUPPORTED_IMAGE_MIME_TYPES = {
     ".jpg": "image/jpeg",
@@ -101,6 +133,19 @@ _COUNT_LEAKAGE_PATTERN = re.compile(
         "|".join(
             re.escape(term)
             for term in sorted(COUNT_LEAKAGE_TERMS, key=len, reverse=True)
+        )
+    ),
+    flags=re.IGNORECASE,
+)
+_IMPLICIT_COUNT_LEAKAGE_PATTERN = re.compile(
+    r"(?<!\w)(?:{})(?!\w)".format(
+        "|".join(
+            re.escape(term)
+            for term in sorted(
+                IMPLICIT_COUNT_LEAKAGE_TERMS,
+                key=len,
+                reverse=True,
+            )
         )
     ),
     flags=re.IGNORECASE,
@@ -236,17 +281,38 @@ def validate_detailed_description(raw_description: str, class_name: str) -> str:
         raise DescriptionValidationError(
             "quantity leakage: {}".format(leakage_match.group(0).casefold())
         )
+    implicit_match = _IMPLICIT_COUNT_LEAKAGE_PATTERN.search(detailed)
+    if implicit_match:
+        raise DescriptionValidationError(
+            "implicit count leakage: {}".format(
+                implicit_match.group(0).casefold()
+            )
+        )
     if not _class_pattern(class_name).search(detailed):
         raise DescriptionValidationError("target class missing")
     return detailed
 
 
+def is_plural_like_class(class_name: str) -> bool:
+    """Return the deterministic v2 plurality classification for a class."""
+    normalized = class_name.strip().casefold()
+    if not normalized:
+        raise ValueError("class_name must be a non-empty string")
+    return (
+        normalized in IRREGULAR_PLURAL_LIKE_CLASSES
+        or normalized.endswith("s")
+    )
+
+
 def generalize_description(detailed: str, class_name: str) -> str:
-    """Replace every exact class occurrence with ``object`` deterministically."""
+    """Replace exact class occurrences with a plurality-aware target phrase."""
     pattern = _class_pattern(class_name)
     if not pattern.search(detailed):
         raise DescriptionValidationError("target class missing")
-    return pattern.sub("object", detailed)
+    replacement = (
+        "target objects" if is_plural_like_class(class_name) else "target object"
+    )
+    return pattern.sub(replacement, detailed)
 
 
 def load_fsc147s_metadata(metadata_path: Path) -> List[Sample]:
