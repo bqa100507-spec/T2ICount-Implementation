@@ -1,9 +1,22 @@
 import torch
+from PIL import Image
+from torchvision import transforms
 
 from utils.tools import extract_patches, reassemble_patches
 
 
 DENSITY_SCALE = 60.0
+INFERENCE_IMAGE_TRANSFORM = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+])
+
+
+def load_image_tensor(image_path, device):
+    """Load one RGB image with the unchanged T2ICount test transform."""
+    with Image.open(image_path) as image:
+        tensor = INFERENCE_IMAGE_TRANSFORM(image.convert("RGB"))
+    return tensor.unsqueeze(0).to(device)
 
 
 def build_prompt_attention_mask(tokenizer, prompt, max_length=77):
