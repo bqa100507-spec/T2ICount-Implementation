@@ -1,3 +1,4 @@
+import base64
 import contextlib
 import io
 import json
@@ -5,6 +6,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from tools import generate_rich_prompt_bank as rich
@@ -29,6 +31,18 @@ class _RateLimitError(Exception):
 
 class _ConnectError(Exception):
     pass
+
+
+class _RecordingInteractions:
+    def __init__(self):
+        self.calls = []
+
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        return SimpleNamespace(
+            output_text="The Stew pot is dark and centered on the stove.",
+            steps=[{"type": "thought", "content": "must not be extracted"}],
+        )
 
 
 def _create_fixture(root, entries=None):
@@ -104,6 +118,41 @@ class RichPromptGeneratorTests(unittest.TestCase):
         self.assertIn('The target category is: "Stew pot".', prompt)
         self.assertIn('exact category name "Stew pot" verbatim', prompt)
         self.assertEqual(prompt.count("Stew pot"), 2)
+
+    def test_interactions_request_has_exact_model_text_and_image_payload(self):
+        interactions = _RecordingInteractions()
+        adapter = rich.GoogleGenAIClient.__new__(rich.GoogleGenAIClient)
+        adapter._client = SimpleNamespace(interactions=interactions)
+        image_bytes = b"local-image-bytes"
+        protocol = rich.build_generation_prompt("Stew pot")
+
+        result = adapter.generate(image_bytes, "image/png", protocol)
+
+        self.assertEqual(
+            result,
+            "The Stew pot is dark and centered on the stove.",
+        )
+        self.assertEqual(len(interactions.calls), 1)
+        request = interactions.calls[0]
+        self.assertEqual(request["model"], "gemini-3.6-flash")
+        self.assertIs(request["store"], False)
+        inputs = request["input"]
+        text_inputs = [item for item in inputs if item.get("type") == "text"]
+        image_inputs = [item for item in inputs if item.get("type") == "image"]
+        self.assertEqual(text_inputs, [{"type": "text", "text": protocol}])
+        self.assertEqual(len(image_inputs), 1)
+        self.assertEqual(image_inputs[0]["mime_type"], "image/png")
+        self.assertEqual(
+            image_inputs[0]["data"],
+            base64.b64encode(image_bytes).decode("ascii"),
+        )
+        self.assertEqual(len(inputs), 2)
+
+    def test_prompt_bank_metadata_records_model_and_interactions_api(self):
+        metadata = rich.new_prompt_bank("2026-08-28T00:00:00Z")["metadata"]
+
+        self.assertEqual(metadata["generator"], "gemini-3.6-flash")
+        self.assertEqual(metadata["api"], "interactions")
 
     def test_missing_api_key_fails_before_client_creation(self):
         factory = mock.Mock()

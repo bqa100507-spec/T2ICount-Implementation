@@ -6,6 +6,7 @@ T2ICount model, training, or inference stacks.
 """
 
 import argparse
+import base64
 import json
 import os
 import re
@@ -19,7 +20,8 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 
 BENCHMARK = "FSC-147-S"
-MODEL_NAME = "gemini-2.5-flash"
+MODEL_NAME = "gemini-3.6-flash"
+API_NAME = "interactions"
 PROTOCOL_VERSION = "rich-prompt-phase1-v1"
 GENERALIZATION_RULE = "case-insensitive target class -> object"
 ASSET_ROOT_ENV = "T2ICOUNT_ASSET_ROOT"
@@ -161,7 +163,6 @@ class GoogleGenAIClient:
     def __init__(self, api_key: str):
         try:
             from google import genai
-            from google.genai import types
         except ImportError as exc:
             raise ConfigurationError(
                 "The optional google-genai SDK is not installed. Install "
@@ -174,19 +175,22 @@ class GoogleGenAIClient:
             raise ConfigurationError(
                 "Could not initialize the google-genai client."
             ) from exc
-        self._types = types
 
     def generate(self, image_bytes: bytes, mime_type: str, prompt: str) -> str:
-        image_part = self._types.Part.from_bytes(
-            data=image_bytes,
-            mime_type=mime_type,
-        )
-        response = self._client.models.generate_content(
+        interaction = self._client.interactions.create(
             model=MODEL_NAME,
-            contents=[image_part, prompt],
+            store=False,
+            input=[
+                {"type": "text", "text": prompt},
+                {
+                    "type": "image",
+                    "data": base64.b64encode(image_bytes).decode("ascii"),
+                    "mime_type": mime_type,
+                },
+            ],
         )
         try:
-            text = response.text
+            text = interaction.output_text
         except Exception:
             return ""
         return text if isinstance(text, str) else ""
@@ -323,6 +327,7 @@ def _expected_metadata(timestamp: str) -> Dict[str, str]:
     return {
         "benchmark": BENCHMARK,
         "generator": MODEL_NAME,
+        "api": API_NAME,
         "protocol_version": PROTOCOL_VERSION,
         "generation_prompt_template": GENERATION_PROMPT_TEMPLATE,
         "generalization_rule": GENERALIZATION_RULE,
@@ -369,6 +374,7 @@ def load_prompt_bank(
     for key in (
         "benchmark",
         "generator",
+        "api",
         "protocol_version",
         "generation_prompt_template",
         "generalization_rule",
@@ -655,7 +661,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Generate an offline FSC-147-S rich-prompt bank with "
-            "gemini-2.5-flash."
+            "gemini-3.6-flash."
         )
     )
     parser.add_argument(
@@ -666,7 +672,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--metadata", default="FSC-147-S.json")
     parser.add_argument(
         "--output",
-        default="prompts/fsc147s_gemini25flash.json",
+        default="prompts/fsc147s_gemini36flash.json",
     )
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument(

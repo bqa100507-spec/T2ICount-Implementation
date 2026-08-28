@@ -7,23 +7,24 @@ samples. It does not run T2ICount inference, train a model, change a checkpoint,
 or implement the RichCount architecture.
 
 For each sample, the generator sends its FSC147 image and authoritative class
-name to `gemini-2.5-flash`. The stored output contains:
+name to `gemini-3.6-flash` through the Google Gen AI Interactions API. The stored
+output contains:
 
 - `detailed`: Gemini's one-sentence response after whitespace cleanup only.
 - `generalized`: the detailed response with every case-insensitive exact class
   occurrence replaced deterministically by `object`.
 
-The protocol is inspired by RichCount, but it is not an exact RichCount
-reproduction. Phase 1A uses Gemini 2.5 Flash and this repository's fixed
-description protocol rather than the paper's GPT-4 setup.
+The RichCount paper used GPT-4. This protocol is inspired by RichCount, but it
+is not an exact RichCount reproduction: Phase 1A uses Gemini 3.6 Flash and this
+repository's fixed description protocol.
 
 ## Why prompts are generated once
 
 Generation is an offline preprocessing step because API output, availability,
 latency, and cost should not become part of the later counting evaluation. The
-JSON prompt bank records the model name, full prompt template, protocol version,
-and deterministic generalization rule. Reusing that stored bank keeps later
-comparisons on the same prompt inputs.
+JSON prompt bank records the model name, Interactions API transport, full prompt
+template, protocol version, and deterministic generalization rule. Reusing that
+stored bank keeps later comparisons on the same prompt inputs.
 
 The bank intentionally stores no FSC-147-S ground-truth counts, API key, raw API
 response objects, chain-of-thought, or image bytes.
@@ -58,10 +59,14 @@ tracked `.env` file, command-line argument, output JSON, or log:
 $env:GEMINI_API_KEY = "<your-key>"
 ```
 
-The implementation uses the current official `google-genai` SDK, not the legacy
-`google-generativeai` package. Normal generation fails before client creation
-when the key is absent. `--dry-run` deliberately needs no key and imports no
-Gemini SDK code.
+The implementation uses the current official `google-genai` SDK and
+`client.interactions.create()`, not the legacy `google-generativeai` package or
+the Generate Content transport. Each request has one text protocol block and
+one base64-encoded local image block with its MIME type. `store=False` avoids
+retaining the interaction for later turns, and only `interaction.output_text`
+is passed to validation; response steps, thoughts, and tool data are not stored.
+Normal generation fails before client creation when the key is absent.
+`--dry-run` deliberately needs no key and imports no Gemini SDK code.
 
 ## Dry-run and generation
 
@@ -78,7 +83,7 @@ API call or output write:
 python tools/generate_rich_prompt_bank.py `
   --asset-root "D:\T2ICount-assets" `
   --metadata FSC-147-S.json `
-  --output prompts/fsc147s_gemini25flash.json `
+  --output prompts/fsc147s_gemini36flash.json `
   --max-samples 3 `
   --dry-run
 ```
@@ -89,7 +94,7 @@ Run a 30-sample pilot:
 python tools/generate_rich_prompt_bank.py `
   --asset-root "D:\T2ICount-assets" `
   --metadata FSC-147-S.json `
-  --output prompts/fsc147s_gemini25flash.json `
+  --output prompts/fsc147s_gemini36flash.json `
   --max-samples 30 `
   --request-delay 2 `
   --max-retries 3
@@ -107,9 +112,10 @@ missing entries are attempted again. `--overwrite` explicitly regenerates
 successful entries. An interrupted run therefore does not require regenerating
 the whole benchmark.
 
-The tool refuses to append to a bank whose generator, protocol, template, or
-generalization rule differs from the current constants. This prevents silently
-mixing incompatible prompt protocols.
+The tool refuses to append to a bank whose generator, API transport, protocol,
+template, or generalization rule differs from the current constants. This
+prevents silently mixing Gemini 2.5/Generate Content output with Gemini
+3.6/Interactions output.
 
 ## Intentionally deferred
 
