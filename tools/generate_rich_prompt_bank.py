@@ -22,10 +22,9 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 BENCHMARK = "FSC-147-S"
 DEFAULT_MODEL = "gemma-4-26b-a4b-it"
 API_NAME = "interactions"
-PROTOCOL_VERSION = "rich-prompt-phase1-v2"
+PROTOCOL_VERSION = "rich-prompt-phase1-v3"
 GENERALIZATION_RULE = (
-    "case-insensitive exact class replacement: singular-like class -> "
-    "target object; plural-like class -> target objects"
+    "case-insensitive exact class replacement: class name -> object"
 )
 ASSET_ROOT_ENV = "T2ICOUNT_ASSET_ROOT"
 API_KEY_ENV = "GEMINI_API_KEY"
@@ -45,6 +44,9 @@ Focus only on information useful for identifying the target, such as:
 
 Requirements:
 - Include the exact category name "{class_name}" verbatim.
+- Describe only visible evidence of the target category.
+- Do not state that the target category is absent, missing, invisible, or not
+  shown.
 - Do not count the targets.
 - Do not state or imply how many target instances are visible.
 - Do not use digits, number words, or quantity words.
@@ -118,9 +120,20 @@ IMPLICIT_COUNT_LEAKAGE_TERMS = (
     "clusters",
 )
 
-# Small deterministic plurality heuristic. It intentionally avoids an NLP
-# dependency; known false classifications are documented with the protocol.
-IRREGULAR_PLURAL_LIKE_CLASSES = frozenset(("people",))
+# Auditable target-absence phrases. They are applied only in class-aware
+# sentence patterns, so unrelated uses of words such as ``no`` are not rejected.
+TARGET_ABSENCE_TERMS = (
+    "not visible",
+    "not present",
+    "not shown",
+    "not seen",
+    "cannot be seen",
+    "can't be seen",
+    "cannot be found",
+    "invisible",
+    "absent",
+    "missing from the scene",
+)
 
 SUPPORTED_IMAGE_MIME_TYPES = {
     ".jpg": "image/jpeg",
@@ -149,6 +162,12 @@ _IMPLICIT_COUNT_LEAKAGE_PATTERN = re.compile(
         )
     ),
     flags=re.IGNORECASE,
+)
+_TARGET_ABSENCE_TERM_PATTERN = r"(?<!\w)(?:{})(?!\w)".format(
+    "|".join(
+        re.escape(term)
+        for term in sorted(TARGET_ABSENCE_TERMS, key=len, reverse=True)
+    )
 )
 _INTERNAL_SENTENCE_END_PATTERN = re.compile(
     r"[.!?]+(?:[\"')\]]*)\s+\S"
@@ -270,6 +289,51 @@ def _class_pattern(class_name: str) -> re.Pattern:
     )
 
 
+def has_target_absence_claim(detailed: str, class_name: str) -> bool:
+    """Return whether text makes an auditable class-specific absence claim."""
+    escaped_class = re.escape(class_name)
+    class_pattern = r"(?<!\w){}(?!\w)".format(escaped_class)
+    class_then_absence = re.compile(
+        r"{}\s+(?:(?:is|are|was|were)\s+)?{}".format(
+            class_pattern,
+            _TARGET_ABSENCE_TERM_PATTERN,
+        ),
+        flags=re.IGNORECASE,
+    )
+    no_class_observable = re.compile(
+        (
+            r"(?<!\w)no\s+{}\s+(?:"
+            r"(?:(?:is|are|was|were)\s+)?"
+            r"(?:visible|present|shown|seen)"
+            r"|(?:can|could)\s+be\s+(?:seen|found)"
+            r")(?!\w)"
+        ).format(class_pattern),
+        flags=re.IGNORECASE,
+    )
+    there_is_no_class = re.compile(
+        r"(?<!\w)there\s+(?:is|are|was|were)\s+no\s+{}".format(
+            class_pattern
+        ),
+        flags=re.IGNORECASE,
+    )
+    class_is_missing = re.compile(
+        (
+            r"{}\s+(?:(?:is|are|was|were)\s+)?"
+            r"(?<!\w)missing(?!\w)\s*[.!?]?\s*$"
+        ).format(class_pattern),
+        flags=re.IGNORECASE,
+    )
+    return any(
+        pattern.search(detailed)
+        for pattern in (
+            class_then_absence,
+            no_class_observable,
+            there_is_no_class,
+            class_is_missing,
+        )
+    )
+
+
 def validate_detailed_description(raw_description: str, class_name: str) -> str:
     """Validate Gemini text and return whitespace-cleaned text only."""
     if not isinstance(raw_description, str) or not raw_description.strip():
@@ -297,29 +361,17 @@ def validate_detailed_description(raw_description: str, class_name: str) -> str:
         )
     if not _class_pattern(class_name).search(detailed):
         raise DescriptionValidationError("target class missing")
+    if has_target_absence_claim(detailed, class_name):
+        raise DescriptionValidationError("target absence claim")
     return detailed
 
 
-def is_plural_like_class(class_name: str) -> bool:
-    """Return the deterministic v2 plurality classification for a class."""
-    normalized = class_name.strip().casefold()
-    if not normalized:
-        raise ValueError("class_name must be a non-empty string")
-    return (
-        normalized in IRREGULAR_PLURAL_LIKE_CLASSES
-        or normalized.endswith("s")
-    )
-
-
 def generalize_description(detailed: str, class_name: str) -> str:
-    """Replace exact class occurrences with a plurality-aware target phrase."""
+    """Replace exact class occurrences with the literal v3 term ``object``."""
     pattern = _class_pattern(class_name)
     if not pattern.search(detailed):
         raise DescriptionValidationError("target class missing")
-    replacement = (
-        "target objects" if is_plural_like_class(class_name) else "target object"
-    )
-    return pattern.sub(replacement, detailed)
+    return pattern.sub("object", detailed)
 
 
 def load_fsc147s_metadata(metadata_path: Path) -> List[Sample]:
@@ -793,7 +845,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
             "_",
             args.model.casefold(),
         ).strip("_")
-        args.output = "prompts/fsc147s_{}_v2.json".format(model_slug)
+        args.output = "prompts/fsc147s_{}_v3.json".format(model_slug)
     return args
 
 

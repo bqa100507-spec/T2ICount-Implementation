@@ -95,7 +95,7 @@ class RichPromptGeneratorTests(unittest.TestCase):
         self.assertEqual(args.model, "gemma-4-26b-a4b-it")
         self.assertEqual(
             args.output,
-            "prompts/fsc147s_gemma_4_26b_a4b_it_v2.json",
+            "prompts/fsc147s_gemma_4_26b_a4b_it_v3.json",
         )
 
     def test_cli_parses_explicit_model_and_derives_matching_output(self):
@@ -104,7 +104,7 @@ class RichPromptGeneratorTests(unittest.TestCase):
         self.assertEqual(args.model, "gemini-3.6-flash")
         self.assertEqual(
             args.output,
-            "prompts/fsc147s_gemini_3_6_flash_v2.json",
+            "prompts/fsc147s_gemini_3_6_flash_v3.json",
         )
 
     def test_metadata_loading_preserves_order_and_discards_counts(self):
@@ -149,6 +149,12 @@ class RichPromptGeneratorTests(unittest.TestCase):
 
         self.assertIn('The target category is: "Stew pot".', prompt)
         self.assertIn('exact category name "Stew pot" verbatim', prompt)
+        self.assertIn("Describe only visible evidence", prompt)
+        self.assertIn(
+            "Do not state that the target category is absent, missing, "
+            "invisible, or not\n  shown.",
+            prompt,
+        )
         self.assertIn("Do not state or imply how many", prompt)
         self.assertEqual(prompt.count("Stew pot"), 2)
 
@@ -213,13 +219,10 @@ class RichPromptGeneratorTests(unittest.TestCase):
 
         self.assertEqual(metadata["generator"], selected_model)
         self.assertEqual(metadata["api"], "interactions")
-        self.assertEqual(metadata["protocol_version"], "rich-prompt-phase1-v2")
+        self.assertEqual(metadata["protocol_version"], "rich-prompt-phase1-v3")
         self.assertEqual(
             metadata["generalization_rule"],
-            (
-                "case-insensitive exact class replacement: singular-like class "
-                "-> target object; plural-like class -> target objects"
-            ),
+            "case-insensitive exact class replacement: class name -> object",
         )
 
     def test_missing_api_key_fails_before_client_creation(self):
@@ -322,6 +325,74 @@ class RichPromptGeneratorTests(unittest.TestCase):
         self.assertEqual(
             detailed,
             "The Stew pot is dark, round, and centered on the stove.",
+        )
+
+    def test_target_absence_phrases_are_rejected(self):
+        descriptions = (
+            "Bottles are not visible in the scene.",
+            "Bottles are not present in the scene.",
+            "Bottles are not shown in the scene.",
+            "Bottles are not seen in the scene.",
+            "Bottles cannot be seen in the scene.",
+            "Bottles can't be seen in the scene.",
+            "Bottles cannot be found in the scene.",
+            "Bottles are invisible in the scene.",
+            "Bottles are absent from the scene.",
+            "Bottles are missing from the scene.",
+            "Bottles are missing.",
+        )
+        for description in descriptions:
+            with self.subTest(description=description), self.assertRaisesRegex(
+                rich.DescriptionValidationError,
+                "target absence claim",
+            ):
+                rich.validate_detailed_description(description, "bottles")
+
+    def test_class_aware_no_target_claims_are_rejected(self):
+        descriptions = (
+            "No bottles are visible in the scene.",
+            "No bottles are present in the scene.",
+            "No bottles can be seen in the scene.",
+            "There are no bottles in the scene.",
+            "THERE ARE NO BOTTLES in the scene.",
+        )
+        for description in descriptions:
+            with self.subTest(description=description), self.assertRaisesRegex(
+                rich.DescriptionValidationError,
+                "target absence claim",
+            ):
+                rich.validate_detailed_description(description, "bottles")
+
+    def test_target_absence_class_pattern_escapes_punctuation(self):
+        with self.assertRaisesRegex(
+            rich.DescriptionValidationError,
+            "target absence claim",
+        ):
+            rich.validate_detailed_description(
+                "There are no C++ bottles in the scene.",
+                "C++ bottles",
+            )
+
+    def test_visible_target_description_passes_absence_validation(self):
+        detailed = rich.validate_detailed_description(
+            "Dark green bottles stand behind the grapes.",
+            "bottles",
+        )
+
+        self.assertEqual(
+            detailed,
+            "Dark green bottles stand behind the grapes.",
+        )
+
+    def test_unrelated_no_does_not_trigger_target_absence(self):
+        detailed = rich.validate_detailed_description(
+            "Dark green bottles have no labels and stand behind the grapes.",
+            "bottles",
+        )
+
+        self.assertEqual(
+            detailed,
+            "Dark green bottles have no labels and stand behind the grapes.",
         )
 
     def test_digits_are_rejected(self):
@@ -428,29 +499,33 @@ class RichPromptGeneratorTests(unittest.TestCase):
         self.assertEqual(
             first,
             (
-                "The target object is dark and the target object has curved "
-                "handles."
+                "The object is dark and the object has curved handles."
             ),
         )
         self.assertEqual(first, second)
 
-    def test_generalization_uses_plurality_aware_target_phrase(self):
+    def test_generalization_always_uses_literal_object(self):
         cases = (
-            ("Spatula", "The Spatula is metallic.", "The target object is metallic."),
+            ("Spatula", "The Spatula is metallic.", "The object is metallic."),
             (
                 "Stew pot",
                 "The Stew pot has steel surfaces.",
-                "The target object has steel surfaces.",
+                "The object has steel surfaces.",
             ),
             (
                 "people",
-                "The people have dark clothing.",
-                "The target objects have dark clothing.",
+                "People wearing dark clothing stand near the produce.",
+                "object wearing dark clothing stand near the produce.",
             ),
             (
-                "strawberries",
-                "The strawberries have red surfaces.",
-                "The target objects have red surfaces.",
+                "lemons",
+                "Yellow lemons are arranged in green crates.",
+                "Yellow object are arranged in green crates.",
+            ),
+            (
+                "polka dots",
+                "White polka dots decorate the red cups.",
+                "White object decorate the red cups.",
             ),
         )
         for class_name, detailed, expected in cases:
@@ -460,16 +535,27 @@ class RichPromptGeneratorTests(unittest.TestCase):
                     expected,
                 )
 
+    def test_v3_has_no_plurality_heuristic_or_target_object_replacement(self):
+        self.assertFalse(hasattr(rich, "IRREGULAR_PLURAL_LIKE_CLASSES"))
+        self.assertFalse(hasattr(rich, "is_plural_like_class"))
+        for class_name in ("Spatula", "people", "lemons", "polka dots"):
+            generalized = rich.generalize_description(
+                "The {} remain visually distinctive.".format(class_name),
+                class_name,
+            )
+            self.assertNotIn("target object", generalized.casefold())
+            self.assertNotIn("target objects", generalized.casefold())
+
     def test_generalization_replacement_is_case_insensitive(self):
         self.assertEqual(
             rich.generalize_description(
                 "The STEW POT is dark and round.",
                 "Stew pot",
             ),
-            "The target object is dark and round.",
+            "The object is dark and round.",
         )
 
-    def test_v1_prompt_bank_is_rejected_by_v2_compatibility_check(self):
+    def test_v1_prompt_bank_is_rejected_by_v3_compatibility_check(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             output_path = Path(temp_dir) / "v1-bank.json"
             bank = rich.new_prompt_bank(
@@ -477,6 +563,22 @@ class RichPromptGeneratorTests(unittest.TestCase):
                 "2026-08-28T00:00:00Z",
             )
             bank["metadata"]["protocol_version"] = "rich-prompt-phase1-v1"
+            rich.atomic_save_prompt_bank(bank, output_path)
+
+            with self.assertRaisesRegex(
+                rich.PromptBankError,
+                "incompatible protocol_version",
+            ):
+                rich.load_prompt_bank(output_path, rich.DEFAULT_MODEL)
+
+    def test_v2_prompt_bank_is_rejected_by_v3_compatibility_check(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_path = Path(temp_dir) / "v2-bank.json"
+            bank = rich.new_prompt_bank(
+                rich.DEFAULT_MODEL,
+                "2026-08-28T00:00:00Z",
+            )
+            bank["metadata"]["protocol_version"] = "rich-prompt-phase1-v2"
             rich.atomic_save_prompt_bank(bank, output_path)
 
             with self.assertRaisesRegex(
@@ -527,7 +629,7 @@ class RichPromptGeneratorTests(unittest.TestCase):
             bank["prompts"]["20.jpg"] = {
                 "class": "Stew pot",
                 "detailed": "The Stew pot is dark and round.",
-                "generalized": "The target object is dark and round.",
+                "generalized": "The object is dark and round.",
                 "status": "ok",
                 "attempts": 1,
             }
@@ -551,7 +653,7 @@ class RichPromptGeneratorTests(unittest.TestCase):
             bank["prompts"]["20.jpg"] = {
                 "class": "Stew pot",
                 "detailed": "The Stew pot was previously described.",
-                "generalized": "The target object was previously described.",
+                "generalized": "The object was previously described.",
                 "status": "ok",
                 "attempts": 1,
             }
@@ -583,7 +685,7 @@ class RichPromptGeneratorTests(unittest.TestCase):
             self.assertEqual(len(client.calls), 1)
             self.assertEqual(
                 saved["prompts"]["20.jpg"]["generalized"],
-                "The target object has glossy steel surfaces and curved handles.",
+                "The object has glossy steel surfaces and curved handles.",
             )
 
     def test_failed_generation_never_creates_fallback_prompt(self):
@@ -610,6 +712,40 @@ class RichPromptGeneratorTests(unittest.TestCase):
             self.assertNotIn("20.jpg", saved["prompts"])
             self.assertEqual(saved["failures"]["20.jpg"]["attempts"], 2)
             self.assertNotIn("detailed", saved["failures"]["20.jpg"])
+
+    def test_target_absence_retries_then_records_normal_failure(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            entries = {"214.jpg": {"class": "bottles", "count": 1}}
+            asset_root, metadata_path = _create_fixture(root, entries)
+            config = _config(
+                root,
+                asset_root,
+                metadata_path,
+                max_retries=1,
+            )
+            client = _FakeClient(
+                [
+                    "Bottles are not visible in the scene.",
+                    "There are no bottles in the scene.",
+                ]
+            )
+
+            summary = rich.run_generation(
+                config,
+                client=client,
+                emit=lambda _: None,
+            )
+            saved = json.loads(config.output_path.read_text(encoding="utf-8"))
+
+            self.assertEqual(summary.failed, 1)
+            self.assertEqual(len(client.calls), 2)
+            self.assertNotIn("214.jpg", saved["prompts"])
+            self.assertEqual(
+                saved["failures"]["214.jpg"]["reason"],
+                "target absence claim",
+            )
+            self.assertNotIn("detailed", saved["failures"]["214.jpg"])
 
     def test_output_contains_neither_gt_count_nor_api_key(self):
         with tempfile.TemporaryDirectory() as temp_dir:
