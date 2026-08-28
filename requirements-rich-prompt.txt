@@ -1,0 +1,2 @@
+# Optional Phase 1A preprocessing dependency; current releases require Python >=3.10.
+google-genai==2.20.0
