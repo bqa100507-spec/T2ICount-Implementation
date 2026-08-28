@@ -17,8 +17,8 @@ class _FakeClient:
         self.responses = list(responses)
         self.calls = []
 
-    def generate(self, image_bytes, mime_type, prompt):
-        self.calls.append((image_bytes, mime_type, prompt))
+    def generate(self, model, image_bytes, mime_type, prompt):
+        self.calls.append((model, image_bytes, mime_type, prompt))
         response = self.responses.pop(0)
         if isinstance(response, Exception):
             raise response
@@ -45,6 +45,19 @@ class _RecordingInteractions:
         )
 
 
+class _UnavailableModelError(Exception):
+    status_code = 404
+
+
+class _FailingInteractions:
+    def __init__(self):
+        self.calls = []
+
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        raise _UnavailableModelError("selected model unavailable")
+
+
 def _create_fixture(root, entries=None):
     entries = entries or {
         "20.jpg": {"class": "Stew pot", "count": 17},
@@ -64,6 +77,7 @@ def _config(root, asset_root, metadata_path, **overrides):
         "asset_root": asset_root,
         "metadata_path": metadata_path,
         "output_path": root / "prompts" / "bank.json",
+        "model": rich.DEFAULT_MODEL,
         "max_samples": None,
         "max_retries": 0,
         "request_delay": 0.0,
@@ -75,6 +89,24 @@ def _config(root, asset_root, metadata_path, **overrides):
 
 
 class RichPromptGeneratorTests(unittest.TestCase):
+    def test_cli_default_model_and_model_safe_output(self):
+        args = rich.parse_args([])
+
+        self.assertEqual(args.model, "gemma-4-26b-a4b-it")
+        self.assertEqual(
+            args.output,
+            "prompts/fsc147s_gemma_4_26b_a4b_it_v2.json",
+        )
+
+    def test_cli_parses_explicit_model_and_derives_matching_output(self):
+        args = rich.parse_args(["--model", "gemini-3.6-flash"])
+
+        self.assertEqual(args.model, "gemini-3.6-flash")
+        self.assertEqual(
+            args.output,
+            "prompts/fsc147s_gemini_3_6_flash_v2.json",
+        )
+
     def test_metadata_loading_preserves_order_and_discards_counts(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -127,7 +159,13 @@ class RichPromptGeneratorTests(unittest.TestCase):
         image_bytes = b"local-image-bytes"
         protocol = rich.build_generation_prompt("Stew pot")
 
-        result = adapter.generate(image_bytes, "image/png", protocol)
+        selected_model = "gemini-3.6-flash"
+        result = adapter.generate(
+            selected_model,
+            image_bytes,
+            "image/png",
+            protocol,
+        )
 
         self.assertEqual(
             result,
@@ -135,7 +173,7 @@ class RichPromptGeneratorTests(unittest.TestCase):
         )
         self.assertEqual(len(interactions.calls), 1)
         request = interactions.calls[0]
-        self.assertEqual(request["model"], "gemini-3.6-flash")
+        self.assertEqual(request["model"], selected_model)
         self.assertIs(request["store"], False)
         inputs = request["input"]
         text_inputs = [item for item in inputs if item.get("type") == "text"]
@@ -149,10 +187,31 @@ class RichPromptGeneratorTests(unittest.TestCase):
         )
         self.assertEqual(len(inputs), 2)
 
-    def test_prompt_bank_metadata_records_model_and_interactions_api(self):
-        metadata = rich.new_prompt_bank("2026-08-28T00:00:00Z")["metadata"]
+    def test_unavailable_selected_model_has_no_automatic_fallback(self):
+        interactions = _FailingInteractions()
+        adapter = rich.GoogleGenAIClient.__new__(rich.GoogleGenAIClient)
+        adapter._client = SimpleNamespace(interactions=interactions)
+        selected_model = "gemini-3.6-flash"
 
-        self.assertEqual(metadata["generator"], "gemini-3.6-flash")
+        with self.assertRaises(_UnavailableModelError):
+            adapter.generate(
+                selected_model,
+                b"local-image-bytes",
+                "image/jpeg",
+                rich.build_generation_prompt("Stew pot"),
+            )
+
+        self.assertEqual(len(interactions.calls), 1)
+        self.assertEqual(interactions.calls[0]["model"], selected_model)
+
+    def test_prompt_bank_metadata_records_model_and_interactions_api(self):
+        selected_model = "gemini-3.6-flash"
+        metadata = rich.new_prompt_bank(
+            selected_model,
+            "2026-08-28T00:00:00Z",
+        )["metadata"]
+
+        self.assertEqual(metadata["generator"], selected_model)
         self.assertEqual(metadata["api"], "interactions")
         self.assertEqual(metadata["protocol_version"], "rich-prompt-phase1-v2")
         self.assertEqual(
@@ -182,6 +241,48 @@ class RichPromptGeneratorTests(unittest.TestCase):
         self.assertEqual(return_code, 2)
         self.assertIn("GEMINI_API_KEY", stderr.getvalue())
         factory.assert_not_called()
+
+    def test_cli_selected_model_reaches_client_and_metadata(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            asset_root, metadata_path = _create_fixture(root)
+            output_path = root / "prompts" / "bank.json"
+            selected_model = "gemini-3.6-flash"
+            client = _FakeClient(
+                ["The Stew pot is dark and centered on the stove."]
+            )
+
+            with mock.patch.dict(
+                os.environ,
+                {"GEMINI_API_KEY": "test-key"},
+                clear=True,
+            ):
+                return_code = rich.main(
+                    [
+                        "--asset-root",
+                        str(asset_root),
+                        "--metadata",
+                        str(metadata_path),
+                        "--output",
+                        str(output_path),
+                        "--model",
+                        selected_model,
+                        "--request-delay",
+                        "0",
+                        "--max-retries",
+                        "0",
+                    ],
+                    client_factory=lambda _: client,
+                )
+
+            saved = json.loads(output_path.read_text(encoding="utf-8"))
+
+            self.assertEqual(return_code, 0)
+            self.assertEqual(client.calls[0][0], selected_model)
+            self.assertEqual(
+                saved["metadata"]["generator"],
+                selected_model,
+            )
 
     def test_dry_run_needs_no_key_makes_no_calls_and_writes_nothing(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -371,7 +472,10 @@ class RichPromptGeneratorTests(unittest.TestCase):
     def test_v1_prompt_bank_is_rejected_by_v2_compatibility_check(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             output_path = Path(temp_dir) / "v1-bank.json"
-            bank = rich.new_prompt_bank("2026-08-28T00:00:00Z")
+            bank = rich.new_prompt_bank(
+                rich.DEFAULT_MODEL,
+                "2026-08-28T00:00:00Z",
+            )
             bank["metadata"]["protocol_version"] = "rich-prompt-phase1-v1"
             rich.atomic_save_prompt_bank(bank, output_path)
 
@@ -379,14 +483,47 @@ class RichPromptGeneratorTests(unittest.TestCase):
                 rich.PromptBankError,
                 "incompatible protocol_version",
             ):
-                rich.load_prompt_bank(output_path)
+                rich.load_prompt_bank(output_path, rich.DEFAULT_MODEL)
+
+    def test_gemma_bank_rejects_gemini_resume(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_path = Path(temp_dir) / "gemma-bank.json"
+            bank = rich.new_prompt_bank(
+                "gemma-4-26b-a4b-it",
+                "2026-08-28T00:00:00Z",
+            )
+            rich.atomic_save_prompt_bank(bank, output_path)
+
+            with self.assertRaisesRegex(
+                rich.PromptBankError,
+                "incompatible generator",
+            ):
+                rich.load_prompt_bank(output_path, "gemini-3.6-flash")
+
+    def test_gemini_bank_rejects_gemma_resume(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_path = Path(temp_dir) / "gemini-bank.json"
+            bank = rich.new_prompt_bank(
+                "gemini-3.6-flash",
+                "2026-08-28T00:00:00Z",
+            )
+            rich.atomic_save_prompt_bank(bank, output_path)
+
+            with self.assertRaisesRegex(
+                rich.PromptBankError,
+                "incompatible generator",
+            ):
+                rich.load_prompt_bank(output_path, "gemma-4-26b-a4b-it")
 
     def test_resume_skips_successful_entry(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             asset_root, metadata_path = _create_fixture(root)
             config = _config(root, asset_root, metadata_path)
-            bank = rich.new_prompt_bank("2026-08-28T00:00:00Z")
+            bank = rich.new_prompt_bank(
+                config.model,
+                "2026-08-28T00:00:00Z",
+            )
             bank["prompts"]["20.jpg"] = {
                 "class": "Stew pot",
                 "detailed": "The Stew pot is dark and round.",
@@ -407,7 +544,10 @@ class RichPromptGeneratorTests(unittest.TestCase):
             root = Path(temp_dir)
             asset_root, metadata_path = _create_fixture(root)
             config = _config(root, asset_root, metadata_path, overwrite=True)
-            bank = rich.new_prompt_bank("2026-08-28T00:00:00Z")
+            bank = rich.new_prompt_bank(
+                config.model,
+                "2026-08-28T00:00:00Z",
+            )
             bank["prompts"]["20.jpg"] = {
                 "class": "Stew pot",
                 "detailed": "The Stew pot was previously described.",

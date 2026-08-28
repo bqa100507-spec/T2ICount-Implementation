@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Generate and persist FSC-147-S rich descriptions with Gemini.
+"""Generate and persist FSC-147-S rich descriptions with Google Gen AI.
 
 This is an offline preprocessing tool. It deliberately has no imports from the
 T2ICount model, training, or inference stacks.
@@ -20,7 +20,7 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 
 BENCHMARK = "FSC-147-S"
-MODEL_NAME = "gemini-3.6-flash"
+DEFAULT_MODEL = "gemma-4-26b-a4b-it"
 API_NAME = "interactions"
 PROTOCOL_VERSION = "rich-prompt-phase1-v2"
 GENERALIZATION_RULE = (
@@ -186,6 +186,7 @@ class GenerationConfig:
     asset_root: Path
     metadata_path: Path
     output_path: Path
+    model: str
     max_samples: Optional[int] = None
     max_retries: int = 3
     request_delay: float = 2.0
@@ -221,9 +222,15 @@ class GoogleGenAIClient:
                 "Could not initialize the google-genai client."
             ) from exc
 
-    def generate(self, image_bytes: bytes, mime_type: str, prompt: str) -> str:
+    def generate(
+        self,
+        model: str,
+        image_bytes: bytes,
+        mime_type: str,
+        prompt: str,
+    ) -> str:
         interaction = self._client.interactions.create(
-            model=MODEL_NAME,
+            model=model,
             store=False,
             input=[
                 {"type": "text", "text": prompt},
@@ -389,10 +396,10 @@ def resolve_image_path(asset_root: Path, image_name: str) -> Tuple[Path, str]:
     return image_path, mime_type
 
 
-def _expected_metadata(timestamp: str) -> Dict[str, str]:
+def _expected_metadata(timestamp: str, model: str) -> Dict[str, str]:
     return {
         "benchmark": BENCHMARK,
-        "generator": MODEL_NAME,
+        "generator": model,
         "api": API_NAME,
         "protocol_version": PROTOCOL_VERSION,
         "generation_prompt_template": GENERATION_PROMPT_TEMPLATE,
@@ -402,10 +409,13 @@ def _expected_metadata(timestamp: str) -> Dict[str, str]:
     }
 
 
-def new_prompt_bank(timestamp: Optional[str] = None) -> Dict[str, object]:
+def new_prompt_bank(
+    model: str,
+    timestamp: Optional[str] = None,
+) -> Dict[str, object]:
     created_at = timestamp or utc_timestamp()
     return {
-        "metadata": _expected_metadata(created_at),
+        "metadata": _expected_metadata(created_at, model),
         "prompts": {},
         "failures": {},
     }
@@ -413,11 +423,12 @@ def new_prompt_bank(timestamp: Optional[str] = None) -> Dict[str, object]:
 
 def load_prompt_bank(
     output_path: Path,
+    model: str,
     timestamp_factory: Callable[[], str] = utc_timestamp,
 ) -> Dict[str, object]:
     path = Path(output_path).expanduser().absolute()
     if not path.exists():
-        return new_prompt_bank(timestamp_factory())
+        return new_prompt_bank(model, timestamp_factory())
     if not path.is_file():
         raise PromptBankError("Prompt-bank output is not a file: {}".format(path))
     try:
@@ -436,7 +447,7 @@ def load_prompt_bank(
     if not isinstance(prompts, dict) or not isinstance(failures, dict):
         raise PromptBankError("Prompt bank must contain prompts and failures objects")
 
-    expected = _expected_metadata(metadata.get("created_at", ""))
+    expected = _expected_metadata(metadata.get("created_at", ""), model)
     for key in (
         "benchmark",
         "generator",
@@ -534,6 +545,8 @@ def safe_api_error_reason(exc: Exception) -> str:
 
 
 def _validate_config(config: GenerationConfig) -> None:
+    if not isinstance(config.model, str) or not config.model.strip():
+        raise ConfigurationError("--model must be a non-empty string")
     if config.max_samples is not None and config.max_samples <= 0:
         raise ConfigurationError("--max-samples must be greater than zero")
     if config.max_retries < 0:
@@ -566,7 +579,11 @@ def run_generation(
             (sample, image_path, mime_type, generation_prompt)
         )
 
-    bank = load_prompt_bank(config.output_path, timestamp_factory)
+    bank = load_prompt_bank(
+        config.output_path,
+        config.model,
+        timestamp_factory,
+    )
     prompts = bank["prompts"]
     failures = bank["failures"]
     if not isinstance(prompts, dict) or not isinstance(failures, dict):
@@ -593,7 +610,9 @@ def run_generation(
         return RunSummary(selected, 0, 0, 0, True)
 
     if client is None:
-        raise ConfigurationError("A Gemini client is required outside dry-run mode")
+        raise ConfigurationError(
+            "A Google Gen AI client is required outside dry-run mode"
+        )
 
     generated = 0
     skipped = 0
@@ -641,6 +660,7 @@ def run_generation(
 
             try:
                 raw_description = client.generate(
+                    config.model,
                     image_bytes,
                     mime_type,
                     generation_prompt,
@@ -726,8 +746,8 @@ def run_generation(
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Generate an offline FSC-147-S rich-prompt bank with "
-            "gemini-3.6-flash."
+            "Generate an offline FSC-147-S rich-prompt bank through the "
+            "Google Gen AI Interactions API."
         )
     )
     parser.add_argument(
@@ -737,8 +757,17 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument("--metadata", default="FSC-147-S.json")
     parser.add_argument(
+        "--model",
+        default=DEFAULT_MODEL,
+        help="Generator model (default: %(default)s).",
+    )
+    parser.add_argument(
         "--output",
-        default="prompts/fsc147s_gemini36flash.json",
+        default=None,
+        help=(
+            "Prompt-bank path; defaults to a model-derived filename under "
+            "prompts/."
+        ),
     )
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument(
@@ -755,7 +784,17 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if not args.model.strip():
+        parser.error("--model must be a non-empty string")
+    if args.output is None:
+        model_slug = re.sub(
+            r"[^a-z0-9]+",
+            "_",
+            args.model.casefold(),
+        ).strip("_")
+        args.output = "prompts/fsc147s_{}_v2.json".format(model_slug)
+    return args
 
 
 def main(
@@ -777,6 +816,7 @@ def main(
             asset_root=asset_root,
             metadata_path=Path(args.metadata).expanduser().absolute(),
             output_path=Path(args.output).expanduser().absolute(),
+            model=args.model,
             max_samples=args.max_samples,
             max_retries=args.max_retries,
             request_delay=args.request_delay,
