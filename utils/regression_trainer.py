@@ -15,6 +15,7 @@ from tqdm import tqdm
 from utils.checkpoints import load_trusted_legacy_checkpoint
 from utils.ssim_loss import cal_avg_ms_ssim
 from utils.inference import predict_count
+from utils.train_subset import select_train_subset_indices
 
 
 def setup_seed(seed):
@@ -97,11 +98,9 @@ def apply_train_sample_subset(datasets, sample_limit, subset_seed):
     if sample_limit > 0:
         train_dataset = datasets['train']
         effective_samples = min(sample_limit, len(train_dataset))
-        generator = torch.Generator()
-        generator.manual_seed(subset_seed)
-        indices = torch.randperm(
-            len(train_dataset), generator=generator
-        )[:effective_samples].tolist()
+        indices = select_train_subset_indices(
+            len(train_dataset), sample_limit, subset_seed
+        )
         datasets['train'] = Subset(train_dataset, indices)
         print(
             'Training subset active: using {} of {} training samples '
