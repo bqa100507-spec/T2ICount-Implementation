@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Generate and persist FSC-147-S rich descriptions with Google Gen AI.
+"""Generate and persist FSC147 rich descriptions with Google Gen AI.
 
 This is an offline preprocessing tool. It deliberately has no imports from the
 T2ICount model, training, or inference stacks.
@@ -7,19 +7,31 @@ T2ICount model, training, or inference stacks.
 
 import argparse
 import base64
+import hashlib
 import json
 import os
 import re
 import sys
 import tempfile
+import threading
 import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 
-BENCHMARK = "FSC-147-S"
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+if str(REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPOSITORY_ROOT))
+
+from utils.train_subset import select_train_subset_indices
+
+
+FSC147S_BENCHMARK = "FSC-147-S"
+FSC147_BENCHMARK = "FSC147"
+BENCHMARK = FSC147S_BENCHMARK
 DEFAULT_MODEL = "gemma-4-26b-a4b-it"
 API_NAME = "interactions"
 PROTOCOL_VERSION = "rich-prompt-phase1-v3"
@@ -211,6 +223,10 @@ class GenerationConfig:
     request_delay: float = 2.0
     overwrite: bool = False
     dry_run: bool = False
+    split: str = "fsc147s"
+    train_samples: int = 0
+    train_subset_seed: int = 3407
+    concurrency: int = 1
 
 
 @dataclass(frozen=True)
@@ -220,6 +236,18 @@ class RunSummary:
     skipped: int
     failed: int
     dry_run: bool
+    selected_image_fingerprint: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class SampleResult:
+    index: int
+    sample: Sample
+    succeeded: bool
+    attempts: int
+    detailed: Optional[str] = None
+    generalized: Optional[str] = None
+    failure_reason: str = "generation did not complete"
 
 
 class GoogleGenAIClient:
@@ -411,6 +439,103 @@ def load_fsc147s_metadata(metadata_path: Path) -> List[Sample]:
     return samples
 
 
+def _load_json_object(path: Path, label: str) -> Dict[str, object]:
+    if not path.is_file():
+        raise MetadataError("Missing {} file: {}".format(label, path))
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, ValueError) as exc:
+        raise MetadataError("Could not parse {}: {}".format(label, path)) from exc
+    if not isinstance(payload, dict):
+        raise MetadataError("{} must be a JSON object".format(label))
+    return payload
+
+
+def _fsc147_dataset_root(asset_root: Path) -> Path:
+    return Path(asset_root) / "datasets" / "FSC147"
+
+
+def load_fsc147_split_samples(
+    asset_root: Path,
+    split: str,
+    train_samples: int,
+    train_subset_seed: int,
+) -> List[Sample]:
+    """Load official FSC147 metadata and apply the trainer's shared selector."""
+    if split != "train":
+        raise ConfigurationError(
+            "Official FSC147 prompt generation currently supports --split train"
+        )
+
+    dataset_root = _fsc147_dataset_root(asset_root)
+    metadata_root = dataset_root / "FSC_147"
+    split_path = metadata_root / "Train_Test_Val_FSC_147.json"
+    classes_path = metadata_root / "ImageClasses_FSC147.txt"
+    split_metadata = _load_json_object(split_path, "FSC147 split metadata")
+
+    image_names = split_metadata.get(split)
+    if not isinstance(image_names, list) or not all(
+        isinstance(image_name, str)
+        and image_name
+        and Path(image_name).name == image_name
+        for image_name in image_names
+    ):
+        raise MetadataError("FSC147 split '{}' must be a list of filenames".format(split))
+    if len(set(image_names)) != len(image_names):
+        raise MetadataError("FSC147 split '{}' contains duplicate filenames".format(split))
+
+    if not classes_path.is_file():
+        raise MetadataError("Missing FSC147 class metadata file: {}".format(classes_path))
+    classes = {}
+    try:
+        with classes_path.open("r", encoding="utf-8") as handle:
+            for line_number, raw_line in enumerate(handle, start=1):
+                line = raw_line.strip()
+                if not line:
+                    continue
+                fields = line.split("\t")
+                if len(fields) != 2 or not fields[0] or not fields[1].strip():
+                    raise MetadataError(
+                        "Invalid FSC147 class metadata at line {}".format(line_number)
+                    )
+                if fields[0] in classes:
+                    raise MetadataError(
+                        "Duplicate FSC147 class metadata for {}".format(fields[0])
+                    )
+                classes[fields[0]] = fields[1].strip()
+    except OSError as exc:
+        raise MetadataError(
+            "Could not read FSC147 class metadata: {}".format(classes_path)
+        ) from exc
+
+    missing_classes = [name for name in image_names if name not in classes]
+    if missing_classes:
+        raise MetadataError(
+            "FSC147 class metadata is missing {}".format(missing_classes[0])
+        )
+
+    indices = select_train_subset_indices(
+        len(image_names),
+        train_samples,
+        train_subset_seed,
+    )
+    return [
+        Sample(image_names[index], classes[image_names[index]])
+        for index in indices
+    ]
+
+
+def ordered_image_fingerprint(samples: Sequence[Sample]) -> str:
+    """Hash the ordered selected image-name list with an explicit encoding."""
+    serialized = json.dumps(
+        [sample.image_name for sample in samples],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return "sha256:{}".format(hashlib.sha256(serialized).hexdigest())
+
+
 def resolve_asset_root(explicit_root: Optional[Path]) -> Path:
     configured = explicit_root or os.environ.get(ASSET_ROOT_ENV)
     if not configured:
@@ -448,9 +573,15 @@ def resolve_image_path(asset_root: Path, image_name: str) -> Tuple[Path, str]:
     return image_path, mime_type
 
 
-def _expected_metadata(timestamp: str, model: str) -> Dict[str, str]:
-    return {
-        "benchmark": BENCHMARK,
+def _expected_metadata(
+    timestamp: str,
+    model: str,
+    subset_provenance: Optional[Dict[str, object]] = None,
+) -> Dict[str, object]:
+    metadata = {
+        "benchmark": (
+            FSC147_BENCHMARK if subset_provenance else FSC147S_BENCHMARK
+        ),
         "generator": model,
         "api": API_NAME,
         "protocol_version": PROTOCOL_VERSION,
@@ -459,15 +590,23 @@ def _expected_metadata(timestamp: str, model: str) -> Dict[str, str]:
         "created_at": timestamp,
         "updated_at": timestamp,
     }
+    if subset_provenance:
+        metadata.update(subset_provenance)
+    return metadata
 
 
 def new_prompt_bank(
     model: str,
     timestamp: Optional[str] = None,
+    subset_provenance: Optional[Dict[str, object]] = None,
 ) -> Dict[str, object]:
     created_at = timestamp or utc_timestamp()
     return {
-        "metadata": _expected_metadata(created_at, model),
+        "metadata": _expected_metadata(
+            created_at,
+            model,
+            subset_provenance,
+        ),
         "prompts": {},
         "failures": {},
     }
@@ -477,10 +616,15 @@ def load_prompt_bank(
     output_path: Path,
     model: str,
     timestamp_factory: Callable[[], str] = utc_timestamp,
+    subset_provenance: Optional[Dict[str, object]] = None,
 ) -> Dict[str, object]:
     path = Path(output_path).expanduser().absolute()
     if not path.exists():
-        return new_prompt_bank(model, timestamp_factory())
+        return new_prompt_bank(
+            model,
+            timestamp_factory(),
+            subset_provenance,
+        )
     if not path.is_file():
         raise PromptBankError("Prompt-bank output is not a file: {}".format(path))
     try:
@@ -499,15 +643,30 @@ def load_prompt_bank(
     if not isinstance(prompts, dict) or not isinstance(failures, dict):
         raise PromptBankError("Prompt bank must contain prompts and failures objects")
 
-    expected = _expected_metadata(metadata.get("created_at", ""), model)
-    for key in (
+    expected = _expected_metadata(
+        metadata.get("created_at", ""),
+        model,
+        subset_provenance,
+    )
+    compatibility_keys = [
         "benchmark",
         "generator",
         "api",
         "protocol_version",
         "generation_prompt_template",
         "generalization_rule",
-    ):
+    ]
+    if subset_provenance:
+        compatibility_keys.extend(
+            [
+                "split",
+                "train_samples",
+                "train_subset_seed",
+                "selected_sample_count",
+                "selected_image_fingerprint",
+            ]
+        )
+    for key in compatibility_keys:
         if metadata.get(key) != expected[key]:
             raise PromptBankError(
                 "Existing prompt bank has incompatible {}".format(key)
@@ -596,6 +755,148 @@ def safe_api_error_reason(exc: Exception) -> str:
     return "{} ({})".format(kind, type(exc).__name__)
 
 
+def _retry_after_seconds(exc: Exception) -> Optional[float]:
+    candidates = [getattr(exc, "retry_after", None)]
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None)
+    if headers is not None:
+        try:
+            candidates.append(headers.get("Retry-After"))
+        except Exception:
+            pass
+    for candidate in candidates:
+        try:
+            value = float(candidate)
+        except (TypeError, ValueError):
+            continue
+        if value >= 0:
+            return value
+    return None
+
+
+class _RequestThrottle:
+    """Space concurrent request starts by a configurable global interval."""
+
+    def __init__(
+        self,
+        request_delay: float,
+        sleep: Callable[[float], None],
+        clock: Callable[[], float] = time.monotonic,
+    ):
+        self._request_delay = request_delay
+        self._sleep = sleep
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._last_started_at = None
+
+    def wait(self) -> None:
+        with self._lock:
+            now = self._clock()
+            if self._last_started_at is not None:
+                remaining = self._last_started_at + self._request_delay - now
+                if remaining > 0:
+                    self._sleep(remaining)
+                    now = self._clock()
+            self._last_started_at = now
+
+
+def _select_samples(
+    config: GenerationConfig,
+) -> Tuple[List[Sample], Optional[Dict[str, object]]]:
+    if config.split == "train":
+        samples = load_fsc147_split_samples(
+            config.asset_root,
+            config.split,
+            config.train_samples,
+            config.train_subset_seed,
+        )
+        provenance = {
+            "split": config.split,
+            "train_samples": config.train_samples,
+            "train_subset_seed": config.train_subset_seed,
+            "selected_sample_count": len(samples),
+            "selected_image_fingerprint": ordered_image_fingerprint(samples),
+        }
+        return samples, provenance
+
+    samples = load_fsc147s_metadata(config.metadata_path)
+    if config.max_samples is not None:
+        samples = samples[:config.max_samples]
+    return samples, None
+
+
+def _resolve_samples(config: GenerationConfig, samples: Sequence[Sample]):
+    resolved_samples = []
+    for sample in samples:
+        image_path, mime_type = resolve_image_path(
+            config.asset_root,
+            sample.image_name,
+        )
+        generation_prompt = build_generation_prompt(sample.class_name)
+        resolved_samples.append(
+            (sample, image_path, mime_type, generation_prompt)
+        )
+    return resolved_samples
+
+
+def _order_bank_mappings(
+    prompts: Dict[str, object],
+    failures: Dict[str, object],
+    selected_names: Sequence[str],
+) -> None:
+    selected_name_set = set(selected_names)
+    for mapping in (prompts, failures):
+        ordered = {
+            image_name: mapping[image_name]
+            for image_name in selected_names
+            if image_name in mapping
+        }
+        for image_name in sorted(set(mapping) - selected_name_set):
+            ordered[image_name] = mapping[image_name]
+        mapping.clear()
+        mapping.update(ordered)
+
+
+def _persist_result(
+    result: SampleResult,
+    bank: Dict[str, object],
+    output_path: Path,
+    timestamp_factory: Callable[[], str],
+    include_image: bool,
+    deterministic_names: Optional[Sequence[str]] = None,
+) -> None:
+    prompts = bank["prompts"]
+    failures = bank["failures"]
+    if not isinstance(prompts, dict) or not isinstance(failures, dict):
+        raise PromptBankError("Prompt bank has invalid prompt structures")
+
+    image_name = result.sample.image_name
+    if result.succeeded:
+        entry = {
+            "class": result.sample.class_name,
+            "detailed": result.detailed,
+            "generalized": result.generalized,
+            "status": "ok",
+            "attempts": result.attempts,
+        }
+        if include_image:
+            entry = {"image": image_name, **entry}
+        prompts[image_name] = entry
+        failures.pop(image_name, None)
+    else:
+        prompts.pop(image_name, None)
+        failures[image_name] = {
+            "image": image_name,
+            "class": result.sample.class_name,
+            "reason": result.failure_reason,
+            "attempts": result.attempts,
+        }
+
+    if deterministic_names is not None:
+        _order_bank_mappings(prompts, failures, deterministic_names)
+    atomic_save_prompt_bank(bank, output_path, timestamp_factory)
+
+
 def _validate_config(config: GenerationConfig) -> None:
     if not isinstance(config.model, str) or not config.model.strip():
         raise ConfigurationError("--model must be a non-empty string")
@@ -605,6 +906,362 @@ def _validate_config(config: GenerationConfig) -> None:
         raise ConfigurationError("--max-retries must be zero or greater")
     if config.request_delay < 0:
         raise ConfigurationError("--request-delay must be zero or greater")
+    if config.concurrency < 1:
+        raise ConfigurationError("--concurrency must be one or greater")
+    if config.split not in ("fsc147s", "train"):
+        raise ConfigurationError("--split must be fsc147s or train")
+    if config.train_samples < 0:
+        raise ConfigurationError("--train-samples must be zero or greater")
+    if config.split == "train" and config.max_samples is not None:
+        raise ConfigurationError(
+            "--max-samples is only supported for the FSC-147-S path"
+        )
+    if config.split == "fsc147s" and config.train_samples:
+        raise ConfigurationError("--train-samples requires --split train")
+
+
+def _run_sequential_generation(
+    config: GenerationConfig,
+    resolved_samples,
+    bank: Dict[str, object],
+    client,
+    sleep: Callable[[float], None],
+    emit: Callable[[str], None],
+    timestamp_factory: Callable[[], str],
+) -> RunSummary:
+    prompts = bank["prompts"]
+    if not isinstance(prompts, dict):
+        raise PromptBankError("Prompt bank has invalid prompt structures")
+
+    selected = len(resolved_samples)
+    generated = 0
+    skipped = 0
+    failed = 0
+    request_count = 0
+
+    for index, (sample, image_path, mime_type, generation_prompt) in enumerate(
+        resolved_samples,
+        start=1,
+    ):
+        prefix = "[{}/{}] {} | class={}".format(
+            index, selected, sample.image_name, sample.class_name
+        )
+        existing = prompts.get(sample.image_name)
+        if (
+            isinstance(existing, dict)
+            and existing.get("status") == "ok"
+            and not config.overwrite
+        ):
+            emit("{} | skipped".format(prefix))
+            skipped += 1
+            continue
+
+        try:
+            image_bytes = image_path.read_bytes()
+        except OSError as exc:
+            raise ConfigurationError(
+                "Could not read FSC147 image file: {}".format(image_path)
+            ) from exc
+
+        attempts = 0
+        failure_reason = "generation did not complete"
+        succeeded = False
+        retry_after = None
+        for attempt_index in range(1, config.max_retries + 2):
+            if request_count:
+                delay_multiplier = (
+                    2 ** (attempt_index - 2) if attempt_index > 1 else 1
+                )
+                sleep(max(
+                    config.request_delay * delay_multiplier,
+                    retry_after or 0.0,
+                ))
+            retry_after = None
+            request_count += 1
+            attempts += 1
+
+            try:
+                raw_description = client.generate(
+                    config.model,
+                    image_bytes,
+                    mime_type,
+                    generation_prompt,
+                )
+            except Exception as exc:
+                failure_reason = safe_api_error_reason(exc)
+                can_retry = (
+                    is_transient_api_error(exc)
+                    and attempt_index <= config.max_retries
+                )
+                if can_retry:
+                    retry_after = _retry_after_seconds(exc)
+                    emit(
+                        "{} | retry {}: {}".format(
+                            prefix, attempt_index, failure_reason
+                        )
+                    )
+                    continue
+                break
+
+            try:
+                detailed = validate_detailed_description(
+                    raw_description,
+                    sample.class_name,
+                )
+                generalized = generalize_description(
+                    detailed,
+                    sample.class_name,
+                )
+            except DescriptionValidationError as exc:
+                failure_reason = str(exc)
+                if attempt_index <= config.max_retries:
+                    emit(
+                        "{} | retry {}: {}".format(
+                            prefix, attempt_index, failure_reason
+                        )
+                    )
+                    continue
+                break
+
+            result = SampleResult(
+                index=index,
+                sample=sample,
+                succeeded=True,
+                attempts=attempts,
+                detailed=detailed,
+                generalized=generalized,
+            )
+            _persist_result(
+                result,
+                bank,
+                config.output_path,
+                timestamp_factory,
+                include_image=(config.split == "train"),
+            )
+            emit("{} | generated".format(prefix))
+            generated += 1
+            succeeded = True
+            break
+
+        if succeeded:
+            continue
+
+        result = SampleResult(
+            index=index,
+            sample=sample,
+            succeeded=False,
+            attempts=attempts,
+            failure_reason=failure_reason,
+        )
+        _persist_result(
+            result,
+            bank,
+            config.output_path,
+            timestamp_factory,
+            include_image=(config.split == "train"),
+        )
+        emit("{} | failed: {}".format(prefix, failure_reason))
+        failed += 1
+
+    fingerprint = bank["metadata"].get("selected_image_fingerprint")
+    return RunSummary(selected, generated, skipped, failed, False, fingerprint)
+
+
+def _generate_one_concurrently(
+    index: int,
+    selected: int,
+    resolved_sample,
+    config: GenerationConfig,
+    client,
+    throttle: _RequestThrottle,
+    sleep: Callable[[float], None],
+    emit: Callable[[str], None],
+) -> SampleResult:
+    sample, image_path, mime_type, generation_prompt = resolved_sample
+    prefix = "[{}/{}] {} | class={}".format(
+        index, selected, sample.image_name, sample.class_name
+    )
+    try:
+        image_bytes = image_path.read_bytes()
+    except OSError as exc:
+        return SampleResult(
+            index=index,
+            sample=sample,
+            succeeded=False,
+            attempts=0,
+            failure_reason="image read error ({})".format(type(exc).__name__),
+        )
+
+    attempts = 0
+    failure_reason = "generation did not complete"
+    for attempt_index in range(1, config.max_retries + 2):
+        throttle.wait()
+        attempts += 1
+        retry_after = None
+        try:
+            raw_description = client.generate(
+                config.model,
+                image_bytes,
+                mime_type,
+                generation_prompt,
+            )
+        except Exception as exc:
+            failure_reason = safe_api_error_reason(exc)
+            can_retry = (
+                is_transient_api_error(exc)
+                and attempt_index <= config.max_retries
+            )
+            if not can_retry:
+                break
+            retry_after = _retry_after_seconds(exc)
+        else:
+            try:
+                detailed = validate_detailed_description(
+                    raw_description,
+                    sample.class_name,
+                )
+                generalized = generalize_description(
+                    detailed,
+                    sample.class_name,
+                )
+            except DescriptionValidationError as exc:
+                failure_reason = str(exc)
+                if attempt_index > config.max_retries:
+                    break
+            else:
+                return SampleResult(
+                    index=index,
+                    sample=sample,
+                    succeeded=True,
+                    attempts=attempts,
+                    detailed=detailed,
+                    generalized=generalized,
+                )
+
+        emit(
+            "{} | retry {}: {}".format(
+                prefix, attempt_index, failure_reason
+            )
+        )
+        backoff = config.request_delay * (2 ** (attempt_index - 1))
+        delay = max(backoff, retry_after or 0.0)
+        if delay:
+            sleep(delay)
+
+    return SampleResult(
+        index=index,
+        sample=sample,
+        succeeded=False,
+        attempts=attempts,
+        failure_reason=failure_reason,
+    )
+
+
+def _run_concurrent_generation(
+    config: GenerationConfig,
+    resolved_samples,
+    bank: Dict[str, object],
+    client,
+    sleep: Callable[[float], None],
+    emit: Callable[[str], None],
+    timestamp_factory: Callable[[], str],
+) -> RunSummary:
+    prompts = bank["prompts"]
+    if not isinstance(prompts, dict):
+        raise PromptBankError("Prompt bank has invalid prompt structures")
+
+    selected = len(resolved_samples)
+    generated = 0
+    skipped = 0
+    failed = 0
+    work_items = []
+    for index, resolved_sample in enumerate(resolved_samples, start=1):
+        sample = resolved_sample[0]
+        existing = prompts.get(sample.image_name)
+        prefix = "[{}/{}] {} | class={}".format(
+            index, selected, sample.image_name, sample.class_name
+        )
+        if (
+            isinstance(existing, dict)
+            and existing.get("status") == "ok"
+            and not config.overwrite
+        ):
+            emit("{} | skipped".format(prefix))
+            skipped += 1
+        else:
+            work_items.append((index, resolved_sample))
+
+    selected_names = [item[0].image_name for item in resolved_samples]
+    throttle = _RequestThrottle(config.request_delay, sleep)
+    work_iterator = iter(work_items)
+
+    with ThreadPoolExecutor(max_workers=config.concurrency) as executor:
+        pending = {}
+
+        def submit_next():
+            try:
+                index, resolved_sample = next(work_iterator)
+            except StopIteration:
+                return False
+            future = executor.submit(
+                _generate_one_concurrently,
+                index,
+                selected,
+                resolved_sample,
+                config,
+                client,
+                throttle,
+                sleep,
+                emit,
+            )
+            pending[future] = (index, resolved_sample[0])
+            return True
+
+        for _ in range(config.concurrency):
+            if not submit_next():
+                break
+
+        while pending:
+            completed, _ = wait(tuple(pending), return_when=FIRST_COMPLETED)
+            for future in sorted(completed, key=lambda item: pending[item][0]):
+                index, sample = pending.pop(future)
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    result = SampleResult(
+                        index=index,
+                        sample=sample,
+                        succeeded=False,
+                        attempts=0,
+                        failure_reason="generation worker error ({})".format(
+                            type(exc).__name__
+                        ),
+                    )
+
+                _persist_result(
+                    result,
+                    bank,
+                    config.output_path,
+                    timestamp_factory,
+                    include_image=(config.split == "train"),
+                    deterministic_names=selected_names,
+                )
+                prefix = "[{}/{}] {} | class={}".format(
+                    result.index,
+                    selected,
+                    result.sample.image_name,
+                    result.sample.class_name,
+                )
+                if result.succeeded:
+                    emit("{} | generated".format(prefix))
+                    generated += 1
+                else:
+                    emit("{} | failed: {}".format(prefix, result.failure_reason))
+                    failed += 1
+                submit_next()
+
+    fingerprint = bank["metadata"].get("selected_image_fingerprint")
+    return RunSummary(selected, generated, skipped, failed, False, fingerprint)
 
 
 def run_generation(
@@ -616,32 +1273,46 @@ def run_generation(
 ) -> RunSummary:
     """Run generation with an injected client; dry-run never calls or writes."""
     _validate_config(config)
-    samples = load_fsc147s_metadata(config.metadata_path)
-    if config.max_samples is not None:
-        samples = samples[:config.max_samples]
+    samples, subset_provenance = _select_samples(config)
+    resolved_samples = _resolve_samples(config, samples)
+    selected = len(resolved_samples)
 
-    resolved_samples = []
-    for sample in samples:
-        image_path, mime_type = resolve_image_path(
-            config.asset_root,
-            sample.image_name,
+    if config.dry_run and subset_provenance:
+        for index, (sample, _, _, _) in enumerate(
+            resolved_samples[:5],
+            start=1,
+        ):
+            emit(
+                "[{}/{}] {} | class={} | dry-run ready".format(
+                    index, selected, sample.image_name, sample.class_name
+                )
+            )
+        emit("selected_sample_count={}".format(selected))
+        emit(
+            "ordered_selected_image_fingerprint={}".format(
+                subset_provenance["selected_image_fingerprint"]
+            )
         )
-        generation_prompt = build_generation_prompt(sample.class_name)
-        resolved_samples.append(
-            (sample, image_path, mime_type, generation_prompt)
+        return RunSummary(
+            selected,
+            0,
+            0,
+            0,
+            True,
+            subset_provenance["selected_image_fingerprint"],
         )
 
     bank = load_prompt_bank(
         config.output_path,
         config.model,
         timestamp_factory,
+        subset_provenance,
     )
     prompts = bank["prompts"]
     failures = bank["failures"]
     if not isinstance(prompts, dict) or not isinstance(failures, dict):
         raise PromptBankError("Prompt bank has invalid prompt structures")
 
-    selected = len(resolved_samples)
     if config.dry_run:
         for index, (sample, _, _, _) in enumerate(resolved_samples, start=1):
             existing = prompts.get(sample.image_name)
@@ -665,140 +1336,31 @@ def run_generation(
         raise ConfigurationError(
             "A Google Gen AI client is required outside dry-run mode"
         )
-
-    generated = 0
-    skipped = 0
-    failed = 0
-    request_count = 0
-
-    for index, (sample, image_path, mime_type, generation_prompt) in enumerate(
-        resolved_samples,
-        start=1,
-    ):
-        prefix = "[{}/{}] {} | class={}".format(
-            index,
-            selected,
-            sample.image_name,
-            sample.class_name,
-        )
-        existing = prompts.get(sample.image_name)
-        if (
-            isinstance(existing, dict)
-            and existing.get("status") == "ok"
-            and not config.overwrite
-        ):
-            emit("{} | skipped".format(prefix))
-            skipped += 1
-            continue
-
-        try:
-            image_bytes = image_path.read_bytes()
-        except OSError as exc:
-            raise ConfigurationError(
-                "Could not read FSC147 image file: {}".format(image_path)
-            ) from exc
-
-        attempts = 0
-        failure_reason = "generation did not complete"
-        succeeded = False
-        for attempt_index in range(1, config.max_retries + 2):
-            if request_count:
-                delay_multiplier = (
-                    2 ** (attempt_index - 2) if attempt_index > 1 else 1
-                )
-                sleep(config.request_delay * delay_multiplier)
-            request_count += 1
-            attempts += 1
-
-            try:
-                raw_description = client.generate(
-                    config.model,
-                    image_bytes,
-                    mime_type,
-                    generation_prompt,
-                )
-            except Exception as exc:
-                failure_reason = safe_api_error_reason(exc)
-                can_retry = (
-                    is_transient_api_error(exc)
-                    and attempt_index <= config.max_retries
-                )
-                if can_retry:
-                    emit(
-                        "{} | retry {}: {}".format(
-                            prefix,
-                            attempt_index,
-                            failure_reason,
-                        )
-                    )
-                    continue
-                break
-
-            try:
-                detailed = validate_detailed_description(
-                    raw_description,
-                    sample.class_name,
-                )
-                generalized = generalize_description(
-                    detailed,
-                    sample.class_name,
-                )
-            except DescriptionValidationError as exc:
-                failure_reason = str(exc)
-                if attempt_index <= config.max_retries:
-                    emit(
-                        "{} | retry {}: {}".format(
-                            prefix,
-                            attempt_index,
-                            failure_reason,
-                        )
-                    )
-                    continue
-                break
-
-            prompts[sample.image_name] = {
-                "class": sample.class_name,
-                "detailed": detailed,
-                "generalized": generalized,
-                "status": "ok",
-                "attempts": attempts,
-            }
-            failures.pop(sample.image_name, None)
-            atomic_save_prompt_bank(
-                bank,
-                config.output_path,
-                timestamp_factory,
-            )
-            emit("{} | generated".format(prefix))
-            generated += 1
-            succeeded = True
-            break
-
-        if succeeded:
-            continue
-
-        prompts.pop(sample.image_name, None)
-        failures[sample.image_name] = {
-            "image": sample.image_name,
-            "class": sample.class_name,
-            "reason": failure_reason,
-            "attempts": attempts,
-        }
-        atomic_save_prompt_bank(
+    if config.concurrency == 1:
+        return _run_sequential_generation(
+            config,
+            resolved_samples,
             bank,
-            config.output_path,
+            client,
+            sleep,
+            emit,
             timestamp_factory,
         )
-        emit("{} | failed: {}".format(prefix, failure_reason))
-        failed += 1
-
-    return RunSummary(selected, generated, skipped, failed, False)
+    return _run_concurrent_generation(
+        config,
+        resolved_samples,
+        bank,
+        client,
+        sleep,
+        emit,
+        timestamp_factory,
+    )
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Generate an offline FSC-147-S rich-prompt bank through the "
+            "Generate an offline FSC147 rich-prompt bank through the "
             "Google Gen AI Interactions API."
         )
     )
@@ -808,6 +1370,27 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="External T2ICount asset root; defaults to T2ICOUNT_ASSET_ROOT.",
     )
     parser.add_argument("--metadata", default="FSC-147-S.json")
+    parser.add_argument(
+        "--split",
+        choices=("fsc147s", "train"),
+        default="fsc147s",
+        help=(
+            "Source selection: existing FSC-147-S metadata or the official "
+            "FSC147 training split."
+        ),
+    )
+    parser.add_argument(
+        "--train-samples",
+        type=int,
+        default=0,
+        help="Deterministically subset the official train split; 0 uses all.",
+    )
+    parser.add_argument(
+        "--train-subset-seed",
+        type=int,
+        default=3407,
+        help="Seed for the exact shared training-subset selector.",
+    )
     parser.add_argument(
         "--model",
         default=DEFAULT_MODEL,
@@ -834,6 +1417,15 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         default=2.0,
         help="Base delay in seconds between requests; retries back off exponentially.",
     )
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=1,
+        help=(
+            "Maximum API requests in flight; starts are globally spaced by "
+            "--request-delay."
+        ),
+    )
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
@@ -845,7 +1437,16 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
             "_",
             args.model.casefold(),
         ).strip("_")
-        args.output = "prompts/fsc147s_{}_v3.json".format(model_slug)
+        if args.split == "train":
+            args.output = (
+                "prompts/fsc147_train{}_seed{}_{}_v3.json".format(
+                    args.train_samples,
+                    args.train_subset_seed,
+                    model_slug,
+                )
+            )
+        else:
+            args.output = "prompts/fsc147s_{}_v3.json".format(model_slug)
     return args
 
 
@@ -874,6 +1475,10 @@ def main(
             request_delay=args.request_delay,
             overwrite=args.overwrite,
             dry_run=args.dry_run,
+            split=args.split,
+            train_samples=args.train_samples,
+            train_subset_seed=args.train_subset_seed,
+            concurrency=args.concurrency,
         )
         _validate_config(config)
 
