@@ -1,6 +1,7 @@
 from torch.utils.data import DataLoader, Subset, default_collate
 import torch
 import logging
+import math
 from utils.helper import SaveHandler, AverageMeter
 from utils.trainer import Trainer
 from models.build import build_t2icount
@@ -16,6 +17,11 @@ from utils.checkpoints import load_trusted_legacy_checkpoint
 from utils.ssim_loss import cal_avg_ms_ssim
 from utils.inference import predict_count
 from utils.train_subset import select_train_subset_indices
+from utils.rich_prompt_training import (
+    build_rich_checkpoint_config,
+    load_rich_prompt_bank,
+    validate_resume_rich_config,
+)
 
 
 def setup_seed(seed):
@@ -67,7 +73,33 @@ def train_collate(batch):
     prompt = transposed_batch[2]
     prompt_attn_mask = torch.stack(transposed_batch[3], 0)
     img_attn_mask = torch.stack(transposed_batch[4], 0)
-    return images, den, prompt, prompt_attn_mask, img_attn_mask
+    baseline_batch = images, den, prompt, prompt_attn_mask, img_attn_mask
+    if len(transposed_batch) == 5:
+        return baseline_batch
+
+    rich_samples = transposed_batch[5]
+    rich_batch = {
+        'source_image_name': tuple(
+            sample['source_image_name'] for sample in rich_samples
+        ),
+        'rich_compatible': torch.tensor(
+            [sample['rich_compatible'] for sample in rich_samples],
+            dtype=torch.bool,
+        ),
+        'detailed_prompt': tuple(
+            sample['detailed_prompt'] for sample in rich_samples
+        ),
+        'generalized_prompt': tuple(
+            sample['generalized_prompt'] for sample in rich_samples
+        ),
+        'detailed_prompt_attn_mask': torch.stack(
+            [sample['detailed_prompt_attn_mask'] for sample in rich_samples], 0
+        ),
+        'generalized_prompt_attn_mask': torch.stack(
+            [sample['generalized_prompt_attn_mask'] for sample in rich_samples], 0
+        ),
+    }
+    return baseline_batch + (rich_batch,)
 
 
 def validate_train_sample_options(args):
@@ -75,6 +107,25 @@ def validate_train_sample_options(args):
         raise ValueError(
             '--train-samples and --smoke-train-samples cannot be used '
             'simultaneously.'
+        )
+    rich_prompt_bank = getattr(args, 'rich_prompt_bank', None)
+    consistency_weight = getattr(args, 'rich_consistency_weight', 0.0)
+    diagnostic_steps = getattr(args, 'rich_loss_diagnostic_steps', 0)
+    if not math.isfinite(consistency_weight) or consistency_weight < 0:
+        raise ValueError('--rich-consistency-weight must be finite and non-negative.')
+    if diagnostic_steps < 0:
+        raise ValueError('--rich-loss-diagnostic-steps must be zero or greater.')
+    if not rich_prompt_bank and (
+        consistency_weight != 0.0 or diagnostic_steps != 0
+    ):
+        raise ValueError(
+            '--rich-consistency-weight and --rich-loss-diagnostic-steps '
+            'require --rich-prompt-bank.'
+        )
+    if rich_prompt_bank and getattr(args, 'smoke_train_samples', 0) > 0:
+        raise ValueError(
+            '--rich-prompt-bank cannot be combined with the infrastructure-only '
+            '--smoke-train-samples limiter.'
         )
 
 
@@ -113,6 +164,134 @@ def apply_train_sample_subset(datasets, sample_limit, subset_seed):
 
 def progress_dataloader(dataloader, description):
     return tqdm(dataloader, desc=description)
+
+
+def _selected_train_dataset_info(train_dataset):
+    if isinstance(train_dataset, Subset):
+        base_dataset = train_dataset.dataset
+        indices = list(train_dataset.indices)
+    else:
+        base_dataset = train_dataset
+        indices = list(range(len(base_dataset)))
+    image_names = [
+        os.path.basename(base_dataset.im_list[index]) for index in indices
+    ]
+    return base_dataset, image_names
+
+
+def rich_consistency_loss(class_density, detailed_density, generalized_density):
+    """Return the three pairwise MSE terms and their symmetric mean."""
+    class_detailed = F.mse_loss(class_density, detailed_density)
+    class_generalized = F.mse_loss(class_density, generalized_density)
+    detailed_generalized = F.mse_loss(
+        detailed_density, generalized_density
+    )
+    consistency = (
+        class_detailed + class_generalized + detailed_generalized
+    ) / 3
+    return {
+        'class_detailed': class_detailed,
+        'class_generalized': class_generalized,
+        'detailed_generalized': detailed_generalized,
+        'mean': consistency,
+    }
+
+
+def combine_rich_sample_weighted_loss(
+    class_batch_loss,
+    class_rich_loss,
+    detailed_loss,
+    generalized_loss,
+    consistency_loss,
+    rich_count,
+    total_count,
+    consistency_weight,
+):
+    """Replace compatible class losses without multiplying sample weight."""
+    if rich_count < 1 or rich_count > total_count:
+        raise ValueError('rich_count must be between 1 and total_count.')
+    rich_supervised = (
+        class_rich_loss + detailed_loss + generalized_loss
+    ) / 3
+    rich_fraction = float(rich_count) / float(total_count)
+    combined = class_batch_loss + rich_fraction * (
+        rich_supervised
+        + consistency_weight * consistency_loss
+        - class_rich_loss
+    )
+    return combined, rich_supervised
+
+
+def _numeric(value):
+    if value is None:
+        return float('nan')
+    if torch.is_tensor(value):
+        return value.detach().item()
+    return float(value)
+
+
+def log_rich_loss_diagnostic(
+    step,
+    rich_count,
+    incompatible_count,
+    class_loss,
+    detailed_loss,
+    generalized_loss,
+    consistency_terms,
+    combined_loss,
+    class_mean_count=None,
+    detailed_mean_count=None,
+    generalized_mean_count=None,
+):
+    """Log scalar diagnostics only; return the unchanged optimization loss."""
+    consistency_terms = consistency_terms or {}
+    logging.info(
+        (
+            'Rich diagnostic step=%d compatible=%d incompatible=%d '
+            't2i[class=%.6g detailed=%.6g generalized=%.6g] '
+            'mse[class_detailed=%.6g class_generalized=%.6g '
+            'detailed_generalized=%.6g mean=%.6g] combined=%.6g '
+            'pred_count[class=%.4g detailed=%.4g generalized=%.4g]'
+        ),
+        step,
+        rich_count,
+        incompatible_count,
+        _numeric(class_loss),
+        _numeric(detailed_loss),
+        _numeric(generalized_loss),
+        _numeric(consistency_terms.get('class_detailed')),
+        _numeric(consistency_terms.get('class_generalized')),
+        _numeric(consistency_terms.get('detailed_generalized')),
+        _numeric(consistency_terms.get('mean')),
+        _numeric(combined_loss),
+        _numeric(class_mean_count),
+        _numeric(detailed_mean_count),
+        _numeric(generalized_mean_count),
+    )
+    return combined_loss
+
+
+def _t2i_loss_components(outputs, gt_den_maps, gt_img_attn_mask):
+    pred_den, sim_x2, sim_x1, fused_cross_attn = outputs
+    ambiguous_negative = (
+        fused_cross_attn * gt_img_attn_mask
+    ) >= 0.3
+    positive = gt_den_maps >= (1e-3 * 60)
+    reg_loss = get_reg_loss(
+        pred_den, gt_den_maps, threshold=1e-3 * 60
+    )
+    rrc_loss_stage1 = RRC_loss(sim_x2, ambiguous_negative, positive)
+    rrc_loss_stage2 = RRC_loss(sim_x1, ambiguous_negative, positive)
+    return {
+        'reg': reg_loss,
+        'rrc1': rrc_loss_stage1,
+        'rrc2': rrc_loss_stage2,
+        'total': reg_loss + 0.01 * rrc_loss_stage1 + 0.01 * rrc_loss_stage2,
+    }
+
+
+def _slice_outputs(outputs, indices):
+    return tuple(output.index_select(0, indices) for output in outputs)
 
 
 class Reg_Trainer(Trainer):
@@ -156,6 +335,37 @@ class Reg_Trainer(Trainer):
         apply_train_sample_subset(
             self.datasets, args.train_samples, args.train_subset_seed
         )
+        self.rich_prompt_bank = None
+        self.rich_prompt_config = None
+        rich_prompt_bank_path = getattr(args, 'rich_prompt_bank', None)
+        if rich_prompt_bank_path:
+            base_train_dataset, selected_image_names = (
+                _selected_train_dataset_info(self.datasets['train'])
+            )
+            self.rich_prompt_bank = load_rich_prompt_bank(
+                rich_prompt_bank_path,
+                train_samples=args.train_samples,
+                train_subset_seed=args.train_subset_seed,
+                selected_image_names=selected_image_names,
+                class_by_image=base_train_dataset.cls_dict,
+            )
+            base_train_dataset.rich_prompt_records = (
+                self.rich_prompt_bank.records
+            )
+            self.rich_prompt_config = build_rich_checkpoint_config(
+                self.rich_prompt_bank,
+                consistency_weight=args.rich_consistency_weight,
+                train_samples=args.train_samples,
+                train_subset_seed=args.train_subset_seed,
+            )
+            logging.info(
+                'Rich prompt training enabled: bank=%s samples=%d '
+                'fingerprint=%s consistency_weight=%.6g',
+                self.rich_prompt_config['prompt_bank_filename'],
+                len(selected_image_names),
+                self.rich_prompt_config['prompt_bank_fingerprint'],
+                args.rich_consistency_weight,
+            )
         apply_smoke_train_sample_limit(
             self.datasets, args.smoke_train_samples
         )
@@ -180,6 +390,7 @@ class Reg_Trainer(Trainer):
         self.best_mae = np.inf
         self.best_mse = np.inf
         self.save_list = SaveHandler(num=args.max_num)
+        self._rich_diagnostic_steps_logged = 0
 
         if args.resume:
             suf = args.resume.rsplit('.', 1)[-1]
@@ -193,6 +404,10 @@ class Reg_Trainer(Trainer):
 
     def _load_training_checkpoint(self, path):
         checkpoint = load_trusted_legacy_checkpoint(path, 'cpu')
+        validate_resume_rich_config(
+            getattr(self, 'rich_prompt_config', None),
+            checkpoint.get('rich_prompt_config'),
+        )
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.start_epoch = checkpoint.get(
@@ -211,7 +426,7 @@ class Reg_Trainer(Trainer):
         save_path = os.path.join(
             self.save_dir, '{}_ckpt.tar'.format(self.epoch)
         )
-        _atomic_torch_save({
+        payload = {
             'format_version': 2,
             'epoch': self.epoch,
             'next_epoch': self.epoch + 1,
@@ -220,7 +435,10 @@ class Reg_Trainer(Trainer):
             'best_mae': self.best_mae,
             'best_mse': self.best_mse,
             'rng_state': _capture_rng_state(),
-        }, save_path)
+        }
+        if getattr(self, 'rich_prompt_config', None) is not None:
+            payload['rich_prompt_config'] = dict(self.rich_prompt_config)
+        _atomic_torch_save(payload, save_path)
         self.save_list.append(save_path)
 
     def train(self):
@@ -235,19 +453,35 @@ class Reg_Trainer(Trainer):
                 self._save_training_checkpoint()
 
     def train_epoch(self):
+        args = self.args
         epoch_reg_loss = AverageMeter()
         epoch_RRC1_loss = AverageMeter()
         epoch_RRC2_loss = AverageMeter()
         epoch_mae = AverageMeter()
         epoch_mse = AverageMeter()
+        epoch_rich_supervised = AverageMeter()
+        epoch_rich_consistency = AverageMeter()
+        rich_compatible_seen = 0
+        train_samples_seen = 0
         epoch_start = time.time()
 
         train_dataloader = self.dataloaders['train']
         train_progress = progress_dataloader(
             train_dataloader, 'Train epoch {}'.format(self.epoch)
         )
-        for step, (input, den_map, caption, prompt_attn_mask, img_attn_mask) in enumerate(
-                train_progress):
+        for step, batch in enumerate(train_progress):
+            if len(batch) == 5:
+                input, den_map, caption, prompt_attn_mask, img_attn_mask = batch
+                rich_batch = None
+            else:
+                (
+                    input,
+                    den_map,
+                    caption,
+                    prompt_attn_mask,
+                    img_attn_mask,
+                    rich_batch,
+                ) = batch
             inputs = input.to(self.device)
             gt_den_maps = den_map.to(self.device) * 60
             gt_prompt_attn_mask = prompt_attn_mask.to(self.device).unsqueeze(2).unsqueeze(3)
@@ -255,18 +489,153 @@ class Reg_Trainer(Trainer):
             self.model.set_train()
             with torch.set_grad_enabled(True):
                 N = inputs.shape[0]
-                pred_den, sim_x2, sim_x1, fused_cross_attn = self.model(inputs, caption, gt_prompt_attn_mask)
-                fused_cross_attn_ = fused_cross_attn * gt_img_attn_mask
-                AN = fused_cross_attn_ >= 0.3 
-                reg_loss = get_reg_loss(pred_den, gt_den_maps, threshold=1e-3 * 60)
-                P = gt_den_maps >= (1e-3 * 60)
-                rrc_loss_stage1 = RRC_loss(sim_x2, AN, P)
-                rrc_loss_stage2 = RRC_loss(sim_x1, AN, P)
+                class_outputs = self.model(
+                    inputs, caption, gt_prompt_attn_mask
+                )
+                pred_den = class_outputs[0]
+                class_components = _t2i_loss_components(
+                    class_outputs, gt_den_maps, gt_img_attn_mask
+                )
+                reg_loss = class_components['reg']
+                rrc_loss_stage1 = class_components['rrc1']
+                rrc_loss_stage2 = class_components['rrc2']
 
                 epoch_reg_loss.update(reg_loss.item(), N)
                 epoch_RRC1_loss.update(rrc_loss_stage1.item(), N)
                 epoch_RRC2_loss.update(rrc_loss_stage2.item(), N)
-                loss = reg_loss + 0.01 * rrc_loss_stage1 + 0.01 * rrc_loss_stage2
+                loss = class_components['total']
+
+                rich_count = 0
+                class_rich_loss = None
+                detailed_loss = None
+                generalized_loss = None
+                consistency_terms = None
+                class_mean_count = None
+                detailed_mean_count = None
+                generalized_mean_count = None
+                if rich_batch is not None:
+                    compatible = rich_batch['rich_compatible']
+                    rich_indices_cpu = torch.nonzero(
+                        compatible, as_tuple=False
+                    ).flatten()
+                    rich_count = rich_indices_cpu.numel()
+                    rich_compatible_seen += rich_count
+                    train_samples_seen += N
+                    if rich_count > 0:
+                        rich_indices = rich_indices_cpu.to(self.device)
+                        rich_gt_den_maps = gt_den_maps.index_select(
+                            0, rich_indices
+                        )
+                        rich_img_attn_mask = gt_img_attn_mask.index_select(
+                            0, rich_indices
+                        )
+                        class_rich_outputs = _slice_outputs(
+                            class_outputs, rich_indices
+                        )
+                        class_rich_components = _t2i_loss_components(
+                            class_rich_outputs,
+                            rich_gt_den_maps,
+                            rich_img_attn_mask,
+                        )
+                        class_rich_loss = class_rich_components['total']
+
+                        selected = rich_indices_cpu.tolist()
+                        detailed_captions = tuple(
+                            rich_batch['detailed_prompt'][index]
+                            for index in selected
+                        )
+                        generalized_captions = tuple(
+                            rich_batch['generalized_prompt'][index]
+                            for index in selected
+                        )
+                        detailed_masks = rich_batch[
+                            'detailed_prompt_attn_mask'
+                        ].index_select(0, rich_indices_cpu).to(
+                            self.device
+                        ).unsqueeze(2).unsqueeze(3)
+                        generalized_masks = rich_batch[
+                            'generalized_prompt_attn_mask'
+                        ].index_select(0, rich_indices_cpu).to(
+                            self.device
+                        ).unsqueeze(2).unsqueeze(3)
+                        rich_inputs = inputs.index_select(0, rich_indices)
+
+                        detailed_outputs = self.model(
+                            rich_inputs, detailed_captions, detailed_masks
+                        )
+                        generalized_outputs = self.model(
+                            rich_inputs, generalized_captions,
+                            generalized_masks
+                        )
+                        detailed_components = _t2i_loss_components(
+                            detailed_outputs,
+                            rich_gt_den_maps,
+                            rich_img_attn_mask,
+                        )
+                        generalized_components = _t2i_loss_components(
+                            generalized_outputs,
+                            rich_gt_den_maps,
+                            rich_img_attn_mask,
+                        )
+                        detailed_loss = detailed_components['total']
+                        generalized_loss = generalized_components['total']
+                        consistency_terms = rich_consistency_loss(
+                            class_rich_outputs[0],
+                            detailed_outputs[0],
+                            generalized_outputs[0],
+                        )
+                        loss, rich_supervised = (
+                            combine_rich_sample_weighted_loss(
+                                class_components['total'],
+                                class_rich_loss,
+                                detailed_loss,
+                                generalized_loss,
+                                consistency_terms['mean'],
+                                rich_count,
+                                N,
+                                args.rich_consistency_weight,
+                            )
+                        )
+                        epoch_rich_supervised.update(
+                            rich_supervised.detach().item(), rich_count
+                        )
+                        epoch_rich_consistency.update(
+                            consistency_terms['mean'].detach().item(),
+                            rich_count,
+                        )
+                        if (
+                            self._rich_diagnostic_steps_logged
+                            < args.rich_loss_diagnostic_steps
+                        ):
+                            class_mean_count = (
+                                class_rich_outputs[0]
+                                .detach().flatten(1).sum(1).mean() / 60
+                            )
+                            detailed_mean_count = (
+                                detailed_outputs[0]
+                                .detach().flatten(1).sum(1).mean() / 60
+                            )
+                            generalized_mean_count = (
+                                generalized_outputs[0]
+                                .detach().flatten(1).sum(1).mean() / 60
+                            )
+
+                    diagnostic_limit = args.rich_loss_diagnostic_steps
+                    if self._rich_diagnostic_steps_logged < diagnostic_limit:
+                        log_rich_loss_diagnostic(
+                            self._rich_diagnostic_steps_logged + 1,
+                            rich_count,
+                            N - rich_count,
+                            class_rich_loss,
+                            detailed_loss,
+                            generalized_loss,
+                            consistency_terms,
+                            loss,
+                            class_mean_count,
+                            detailed_mean_count,
+                            generalized_mean_count,
+                        )
+                        self._rich_diagnostic_steps_logged += 1
 
                 gt_counts = torch.sum(gt_den_maps.view(N, -1), dim=1).detach().cpu().numpy() / 60
                 pred_counts = torch.sum(pred_den.view(N, -1), dim=1).detach().cpu().numpy() / 60
@@ -295,6 +664,21 @@ class Reg_Trainer(Trainer):
             'Epoch {} Train, reg:{:.4f}, RRC_stage1:{:.4f}, RRC_stage2:{:.4f}, mae:{:.2f}, mse:{:.2f}, Cost: {:.1f} sec '
             .format(self.epoch, epoch_reg_loss.getAvg(), epoch_RRC1_loss.getAvg(), epoch_RRC2_loss.getAvg(), epoch_mae.getAvg(),
                     np.sqrt(epoch_mse.getAvg()), (time.time() - epoch_start)))
+        if getattr(self, 'rich_prompt_config', None) is not None:
+            rich_fraction = (
+                float(rich_compatible_seen) / train_samples_seen
+                if train_samples_seen else 0.0
+            )
+            logging.info(
+                'Epoch %d Rich, supervised:%.6f, consistency:%.6f, '
+                'compatible:%d/%d (%.4f)',
+                self.epoch,
+                epoch_rich_supervised.getAvg(),
+                epoch_rich_consistency.getAvg(),
+                rich_compatible_seen,
+                train_samples_seen,
+                rich_fraction,
+            )
 
     def val_epoch(self):
         epoch_start = time.time()

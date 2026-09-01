@@ -27,7 +27,7 @@ def random_crop(im_h, im_w, crop_h, crop_w):
 
 class ObjectCount(Dataset):
     def __init__(self, root, crop_size, downsample_ratio, method='train', concat_size=224,
-                 tokenizer=None, clip_path=None):
+                 tokenizer=None, clip_path=None, rich_prompt_records=None):
         super(ObjectCount, self).__init__()
         #self.im_list = sorted(glob(os.path.join(root, 'images/*.jpg')))
         assert crop_size % downsample_ratio == 0
@@ -43,6 +43,9 @@ class ObjectCount(Dataset):
             raise ValueError("ObjectCount requires tokenizer or an explicit local clip_path.")
         self.tokenizer = tokenizer or load_clip_tokenizer(clip_path)
         self.concat_size = concat_size
+        if rich_prompt_records is not None and method != 'train':
+            raise ValueError('Rich prompts are supported only for training.')
+        self.rich_prompt_records = rich_prompt_records
 
         with open(os.path.join(root, 'FSC_147/Train_Test_Val_FSC_147.json'), 'r') as f:
             data_split = json.load(f)[method]
@@ -61,6 +64,7 @@ class ObjectCount(Dataset):
 
     def __getitem__(self, item):
         im_path = self.im_list[item]
+        source_image_name = os.path.basename(im_path)
         den_path = im_path.replace('images_384_VarV2', 'gt_density_map_adaptive_384_VarV2').replace('jpg', 'npy')
 
         img = Image.open(im_path).convert('RGB')
@@ -68,6 +72,7 @@ class ObjectCount(Dataset):
         pts = self.annotations[os.path.basename(im_path)]['points']
 
         prompt = cls_name
+        rich_compatible = True
 
         prompt_attn_mask = torch.zeros(77)
         cls_name_tokens = self.tokenizer(cls_name, add_special_tokens=False, return_tensors='pt')
@@ -96,11 +101,13 @@ class ObjectCount(Dataset):
                         cls_name_tokens = self.tokenizer(prompt, add_special_tokens=False, return_tensors='pt')
                         cls_name_length = cls_name_tokens['input_ids'].shape[1]
                         prompt_attn_mask[1: 1 + cls_name_length] = 1
+                        rich_compatible = False
                     else:
                         wd, ht = img.size
                         den_map = np.load(den_path)
                         img_attn_map = np.ones((ht, wd))
                 else:
+                    rich_compatible = False
                     rand_imgs = random.sample(self.im_list, 3)
                     imgs_info = []
                     wd, ht = img.size
@@ -146,7 +153,43 @@ class ObjectCount(Dataset):
                         imgs_info[3]['img_attention_map']
 
             img, den_map, img_attn_map = self.train_transform_density(out_img, den_map, img_attn_map)
-            return img, den_map, prompt, prompt_attn_mask, img_attn_map
+            if self.rich_prompt_records is None:
+                return img, den_map, prompt, prompt_attn_mask, img_attn_map
+
+            record = self.rich_prompt_records.get(source_image_name)
+            if record is None:
+                raise ValueError(
+                    'No validated rich prompt for source image: {}'.format(
+                        source_image_name
+                    )
+                )
+            rich_compatible = rich_compatible and prompt == cls_name
+            if rich_compatible:
+                detailed_mask = build_rich_prompt_attention_mask(
+                    self.tokenizer, record.detailed
+                )
+                generalized_mask = build_rich_prompt_attention_mask(
+                    self.tokenizer, record.generalized
+                )
+            else:
+                detailed_mask = torch.zeros(77)
+                generalized_mask = torch.zeros(77)
+            rich_metadata = {
+                'source_image_name': source_image_name,
+                'rich_compatible': rich_compatible,
+                'detailed_prompt': record.detailed,
+                'generalized_prompt': record.generalized,
+                'detailed_prompt_attn_mask': detailed_mask,
+                'generalized_prompt_attn_mask': generalized_mask,
+            }
+            return (
+                img,
+                den_map,
+                prompt,
+                prompt_attn_mask,
+                img_attn_map,
+                rich_metadata,
+            )
         else:
             return self.transform(img), len(pts), prompt, prompt_attn_mask, os.path.basename(im_path).split('.')[0]
 
@@ -174,6 +217,38 @@ class ObjectCount(Dataset):
             img_attention_map = np.fliplr(img_attention_map)
 
         return self.transform(img), torch.from_numpy(den_map.copy()).float().unsqueeze(0), torch.from_numpy(img_attention_map.copy()).float().unsqueeze(0)
+
+
+def build_rich_prompt_attention_mask(tokenizer, prompt, max_length=77):
+    """Build a CLIP mask with explicit deterministic 77-token truncation."""
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise ValueError('Rich prompt must be a non-empty string.')
+    if max_length < 3:
+        raise ValueError('CLIP max_length must leave room for prompt tokens.')
+
+    # CLIP reserves positions 0 and 76 for BOS/EOS. The model tokenizer uses
+    # truncation=True,max_length=77 with special tokens, so truncate the raw
+    # prompt to the same deterministic 75-token budget before masking.
+    prompt_token_budget = max_length - 2
+    tokens = tokenizer(
+        prompt,
+        add_special_tokens=False,
+        truncation=True,
+        max_length=prompt_token_budget,
+        return_overflowing_tokens=False,
+        return_tensors='pt',
+    )
+    input_ids = tokens.get('input_ids')
+    if not torch.is_tensor(input_ids) or input_ids.ndim != 2:
+        raise ValueError('Tokenizer returned invalid rich-prompt input_ids.')
+    prompt_length = input_ids.shape[1]
+    if prompt_length < 1 or prompt_length > prompt_token_budget:
+        raise ValueError(
+            'Tokenizer did not honor the CLIP rich-prompt token budget.'
+        )
+    mask = torch.zeros(max_length)
+    mask[1:1 + prompt_length] = 1
+    return mask
 
 
 class IDCIA(Dataset):

@@ -46,6 +46,12 @@ def parse_arg():
                         help='randomly subset the training split; 0 uses the full split')
     parser.add_argument('--train-subset-seed', default=3407, type=int,
                         help='seed for deterministic training subset selection')
+    parser.add_argument('--rich-prompt-bank', default=None,
+                        help='validated Phase 2A prompt bank for opt-in rich training')
+    parser.add_argument('--rich-consistency-weight', default=0.0, type=float,
+                        help='weight for symmetric rich-prompt density consistency')
+    parser.add_argument('--rich-loss-diagnostic-steps', default=0, type=int,
+                        help='log raw rich loss scales for the first N train steps')
     parser.add_argument('--stride', default=384, type=int,
                         help='the stride for patchify')
     parser.add_argument('--beta', default=1e-4, type=float,
@@ -93,6 +99,10 @@ def resolve_training_paths(args):
         )
     if args.resume:
         args.resume = str(require_file(args.resume, 'resume checkpoint'))
+    if getattr(args, 'rich_prompt_bank', None):
+        args.rich_prompt_bank = str(require_file(
+            args.rich_prompt_bank, 'rich prompt bank'
+        ))
     return args
 
 
