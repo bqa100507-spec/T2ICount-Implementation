@@ -66,6 +66,16 @@ def _atomic_torch_save(payload, path):
             os.remove(temporary_path)
 
 
+def validate_checkpoint_interval(checkpoint_interval):
+    if checkpoint_interval < 1:
+        raise ValueError('--checkpoint-interval must be >= 1.')
+
+
+def should_save_training_checkpoint(epoch, checkpoint_interval):
+    validate_checkpoint_interval(checkpoint_interval)
+    return epoch % checkpoint_interval == 0
+
+
 def train_collate(batch):
     transposed_batch = list(zip(*batch))
     images = torch.stack(transposed_batch[0], 0)
@@ -298,6 +308,7 @@ class Reg_Trainer(Trainer):
     def setup(self):
         args = self.args
         validate_train_sample_options(args)
+        validate_checkpoint_interval(args.checkpoint_interval)
         if args.seed != -1:
             setup_seed(args.seed)
             print('Random seed is set as {}'.format(args.seed))
@@ -449,7 +460,8 @@ class Reg_Trainer(Trainer):
             self.train_epoch()
             if self.epoch >= args.start_val and self.epoch % self.args.val_epoch == 0:
                 self.val_epoch()
-            if self.epoch % 5 == 0:
+            if should_save_training_checkpoint(
+                    self.epoch, args.checkpoint_interval):
                 self._save_training_checkpoint()
 
     def train_epoch(self):

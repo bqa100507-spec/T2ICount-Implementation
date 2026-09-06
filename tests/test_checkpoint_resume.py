@@ -1,14 +1,21 @@
+import os
 import random
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
 import torch
 
+from train import parse_arg
 from utils.helper import SaveHandler
-from utils.regression_trainer import Reg_Trainer
+from utils.regression_trainer import (
+    Reg_Trainer,
+    should_save_training_checkpoint,
+)
+from utils.trainer import Trainer
 
 
 def _trainer(model, optimizer, directory):
@@ -23,6 +30,105 @@ def _trainer(model, optimizer, directory):
     trainer.best_mae = 4.5
     trainer.best_mse = 6.75
     return trainer
+
+
+def _run_epochs(checkpoint_interval, epochs):
+    trainer = Reg_Trainer.__new__(Reg_Trainer)
+    trainer.args = SimpleNamespace(
+        epochs=epochs,
+        start_val=epochs + 1,
+        val_epoch=1,
+        checkpoint_interval=checkpoint_interval,
+    )
+    trainer.start_epoch = 0
+    trainer.train_epoch = mock.Mock()
+    trainer.val_epoch = mock.Mock()
+    saved_epochs = []
+    trainer._save_training_checkpoint = lambda: saved_epochs.append(
+        trainer.epoch
+    )
+
+    trainer.train()
+    return saved_epochs
+
+
+class CheckpointIntervalTests(unittest.TestCase):
+    def test_default_interval_reproduces_existing_epoch_cadence(self):
+        with mock.patch('sys.argv', ['train.py']):
+            args = parse_arg()
+
+        self.assertEqual(args.checkpoint_interval, 5)
+        self.assertEqual(
+            _run_epochs(args.checkpoint_interval, 16), [0, 5, 10, 15]
+        )
+
+    def test_interval_one_saves_after_every_epoch(self):
+        self.assertEqual(_run_epochs(1, 6), [0, 1, 2, 3, 4, 5])
+
+    def test_invalid_intervals_are_rejected_by_cli(self):
+        for invalid_interval in (0, -1):
+            with self.subTest(checkpoint_interval=invalid_interval):
+                with mock.patch(
+                    'sys.argv',
+                    ['train.py', '--checkpoint-interval', str(invalid_interval)],
+                ):
+                    with self.assertRaisesRegex(
+                        ValueError, '--checkpoint-interval must be >= 1'
+                    ):
+                        parse_arg()
+
+    def test_checkpoint_interval_is_in_startup_config_log(self):
+        args = SimpleNamespace(
+            content='test-run',
+            save_dir=None,
+            checkpoint_interval=1,
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            args.save_dir = temp_dir
+            with mock.patch('utils.trainer.logger'), mock.patch(
+                'utils.trainer.logging.info'
+            ) as log_info:
+                Trainer(args)
+
+        logged_messages = [call.args[0] for call in log_info.call_args_list]
+        self.assertIn('checkpoint_interval:1', logged_messages)
+
+    def test_checkpoint_interval_does_not_change_best_model_selection(self):
+        trainer = Reg_Trainer.__new__(Reg_Trainer)
+        trainer.args = SimpleNamespace(checkpoint_interval=1)
+        trainer.epoch = 7
+        trainer.best_mae = 5.0
+        trainer.best_mse = 5.0
+        trainer.save_dir = 'checkpoints'
+        model_state = {'weight': object()}
+        trainer.model = mock.Mock()
+        trainer.model.state_dict.return_value = model_state
+        trainer._evaluate_split = mock.Mock(
+            side_effect=[(3.0, 4.0), (4.0, 4.0)]
+        )
+        trainer.test_epoch = mock.Mock()
+
+        with mock.patch(
+            'utils.regression_trainer._atomic_torch_save'
+        ) as atomic_save:
+            trainer.val_epoch()
+            trainer.val_epoch()
+
+        self.assertEqual((trainer.best_mae, trainer.best_mse), (3.0, 4.0))
+        atomic_save.assert_called_once()
+        saved_payload, saved_path = atomic_save.call_args.args
+        self.assertIs(saved_payload, model_state)
+        self.assertEqual(
+            saved_path, os.path.join('checkpoints', 'best_model_7.pth')
+        )
+        trainer.test_epoch.assert_called_once_with()
+
+    def test_pure_cadence_helper_matches_epoch_index_convention(self):
+        saved_epochs = [
+            epoch for epoch in range(12)
+            if should_save_training_checkpoint(epoch, 5)
+        ]
+        self.assertEqual(saved_epochs, [0, 5, 10])
 
 
 class CheckpointResumeTests(unittest.TestCase):

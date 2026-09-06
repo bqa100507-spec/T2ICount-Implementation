@@ -1,6 +1,10 @@
 import argparse
 import torch
-from utils.regression_trainer import Reg_Trainer, validate_train_sample_options
+from utils.regression_trainer import (
+    Reg_Trainer,
+    validate_checkpoint_interval,
+    validate_train_sample_options,
+)
 from utils.paths import (
     AssetPaths,
     require_file,
@@ -36,6 +40,8 @@ def parse_arg():
 
     parser.add_argument('--max-num', default=2, type=int,
                         help='the maximum number of saved models ')
+    parser.add_argument('--checkpoint-interval', default=5, type=int,
+                        help='save a full resumable checkpoint every N epochs')
     parser.add_argument('--resume', default="",
                         help='the path of the resume training model')
     parser.add_argument('--batch-size', default=4, type=int,
@@ -76,6 +82,7 @@ def parse_arg():
 
     args = parser.parse_args()
     validate_train_sample_options(args)
+    validate_checkpoint_interval(args.checkpoint_interval)
     return args
 
 
