@@ -14,9 +14,21 @@ from utils.rich_alignment import (
     configure_stage_a,
     configure_stage_b,
     pool_eot_tokens,
+    prepare_distance_embedding,
     richcount_contrastive_loss,
     validate_resume_provenance,
 )
+from tools.train_rich_alignment import parse_args
+
+
+class NormalizationFlagTests(unittest.TestCase):
+    def test_flag_defaults_to_false(self):
+        self.assertFalse(parse_args([]).normalize_embeddings)
+
+    def test_flag_enables_normalization(self):
+        self.assertTrue(
+            parse_args(["--normalize-embeddings"]).normalize_embeddings
+        )
 
 
 class ContrastiveLossTests(unittest.TestCase):
@@ -46,6 +58,82 @@ class ContrastiveLossTests(unittest.TestCase):
             margin=1.0,
         )
         self.assertAlmostEqual(result["negative_loss"].item(), 0.75 ** 2)
+
+    def test_raw_mode_is_unchanged(self):
+        image = torch.tensor([[2.0, 0.0]])
+        positive = torch.tensor([[4.0, 0.0]])
+        negative = torch.tensor([[2.5, 0.0]])
+        implicit = richcount_contrastive_loss(
+            image, positive, negative, margin=1.0
+        )
+        explicit = richcount_contrastive_loss(
+            image,
+            positive,
+            negative,
+            margin=1.0,
+            normalize_embeddings=False,
+        )
+        self.assertIs(prepare_distance_embedding(image, False), image)
+        self.assertTrue(torch.equal(implicit["loss"], explicit["loss"]))
+        self.assertAlmostEqual(implicit["positive_distance"].item(), 2.0)
+        self.assertAlmostEqual(implicit["negative_distance"].item(), 0.5)
+
+    def test_normalized_embeddings_have_unit_norm(self):
+        embeddings = torch.tensor([[3.0, 4.0], [5.0, 12.0]])
+        normalized = prepare_distance_embedding(embeddings, True)
+        self.assertTrue(
+            torch.allclose(
+                torch.linalg.norm(normalized, dim=-1),
+                torch.ones(2),
+                atol=1e-6,
+            )
+        )
+
+    def test_normalized_euclidean_distance_is_bounded_by_two(self):
+        result = richcount_contrastive_loss(
+            torch.tensor([[1.0, 0.0], [1.0, 0.0]]),
+            torch.tensor([[-1.0, 0.0], [0.0, 1.0]]),
+            torch.tensor([[0.0, -1.0], [-1.0, 0.0]]),
+            margin=1.0,
+            normalize_embeddings=True,
+        )
+        distances = torch.cat(
+            [result["positive_distance"], result["negative_distance"]]
+        )
+        self.assertGreaterEqual(distances.min().item(), 0.0)
+        self.assertLessEqual(distances.max().item(), 2.0)
+
+    def test_positive_scaling_does_not_change_normalized_distance(self):
+        image = torch.tensor([[1.0, 2.0]])
+        text = torch.tensor([[2.0, -1.0]])
+        first = richcount_contrastive_loss(
+            image,
+            text,
+            -text,
+            normalize_embeddings=True,
+        )["positive_distance"]
+        scaled = richcount_contrastive_loss(
+            image * 7.0,
+            text * 3.0,
+            -text * 5.0,
+            normalize_embeddings=True,
+        )["positive_distance"]
+        self.assertTrue(torch.allclose(first, scaled, atol=1e-6))
+
+    def test_contrastive_loss_uses_normalized_final_embeddings(self):
+        image = torch.tensor([[10.0, 0.0]])
+        positive = torch.tensor([[1.0, 0.0]])
+        negative = torch.tensor([[0.0, 1.0]])
+        raw = richcount_contrastive_loss(image, positive, negative)
+        normalized = richcount_contrastive_loss(
+            image, positive, negative, normalize_embeddings=True
+        )
+        self.assertGreater(raw["loss"].item(), 1.0)
+        self.assertAlmostEqual(normalized["positive_distance"].item(), 0.0)
+        self.assertAlmostEqual(
+            normalized["negative_distance"].item(), 2.0 ** 0.5, places=6
+        )
+        self.assertAlmostEqual(normalized["loss"].item(), 0.0)
 
 
 class SplitAndNegativeTests(unittest.TestCase):
@@ -197,6 +285,46 @@ class MetricTests(unittest.TestCase):
         self.assertEqual(metrics["retrieval_r_at_1"], 1.0)
         self.assertLess(metrics["retrieval_sample_r_at_1"], 1.0)
 
+    def test_normalized_margin_violation_can_be_active(self):
+        metrics = compute_mode_alignment_metrics(
+            torch.tensor([[1.0, 0.0]]),
+            torch.tensor([[1.0, 0.0]]),
+            torch.tensor([[1.0, 0.1]]),
+            ["apple"],
+            margin=1.0,
+            retrieval_target="sample",
+            normalize_embeddings=True,
+        )
+        self.assertEqual(metrics["margin_violation_rate"], 1.0)
+        self.assertGreater(metrics["contrastive_loss"], 0.0)
+
+    def test_retrieval_and_pairwise_metrics_use_normalized_convention(self):
+        images = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+        positives = torch.tensor([[10.0, 0.0], [0.0, 0.1]])
+        negatives = positives.flip(0)
+        raw = compute_mode_alignment_metrics(
+            images,
+            positives,
+            negatives,
+            ["apple", "pear"],
+            margin=1.0,
+            retrieval_target="sample",
+            normalize_embeddings=False,
+        )
+        normalized = compute_mode_alignment_metrics(
+            images,
+            positives,
+            negatives,
+            ["apple", "pear"],
+            margin=1.0,
+            retrieval_target="sample",
+            normalize_embeddings=True,
+        )
+        self.assertEqual(raw["retrieval_r_at_1"], 0.5)
+        self.assertEqual(raw["pairwise_alignment_accuracy"], 0.5)
+        self.assertEqual(normalized["retrieval_r_at_1"], 1.0)
+        self.assertEqual(normalized["pairwise_alignment_accuracy"], 1.0)
+
     def test_stage_metrics_have_required_layout(self):
         embeddings = torch.eye(3)
         by_mode = {
@@ -226,6 +354,25 @@ class ResumeProvenanceTests(unittest.TestCase):
         checkpoint = {"provenance": dict(current)}
         checkpoint["provenance"]["split_fingerprint"] = "wrong"
         with self.assertRaisesRegex(RichAlignmentError, "split_fingerprint"):
+            validate_resume_provenance(current, checkpoint)
+
+    def test_resume_rejects_normalization_mismatch(self):
+        current = {
+            "source_subset_fingerprint": "subset",
+            "prompt_bank_fingerprint": "bank",
+            "split_fingerprint": "split",
+            "config_fingerprint": "same-for-focused-test",
+            "normalize_embeddings": True,
+            "training_distance": "l2_normalized_euclidean",
+        }
+        checkpoint = {
+            "provenance": dict(
+                current,
+                normalize_embeddings=False,
+                training_distance="raw_euclidean_l2",
+            )
+        }
+        with self.assertRaisesRegex(RichAlignmentError, "normalize_embeddings"):
             validate_resume_provenance(current, checkpoint)
 
 

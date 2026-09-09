@@ -68,13 +68,23 @@ not guaranteed to be absent from an image, so these negatives may contain
 label noise.
 
 Validation compares frozen CLIP, the trained FFN, and the trained adapter on
-the held-out 100 samples. It reports positive and negative raw Euclidean
+the held-out 100 samples. It reports positive and negative configured Euclidean
 distance, separation gap, pairwise accuracy, margin violations, cosine
 diagnostics, and Euclidean retrieval R@1. Duplicate class prompts use
 class-aware retrieval correctness. FSC-147-S is not used for training or model
 selection. This stage does not construct or train the counting model, density
 maps, RichPrompt Phase 2 loss, or DUMLO, and it makes no claim about improved
 counting performance.
+
+Raw Euclidean distance remains the default. In the first raw-distance smoke,
+projected ViT-L/14 validation distances were approximately 20--23, so no
+negative violated margin 1 and the negative hinge term was inactive. The
+opt-in `--normalize-embeddings` follow-up L2-normalizes only the final image and
+text embeddings immediately before every Euclidean loss, metric, and retrieval
+calculation. This maps their Euclidean distance to `[0,2]` while leaving CLIP
+hidden states, FFN inputs, adapter token outputs, architectures, learning rates,
+and margin unchanged. It is an experimental adaptation for this repository,
+not an exact or undocumented RichCount implementation detail.
 
 Validate the fixed data contract and run a real one-image/three-prompt offline
 CLIP forward without training or output writes:

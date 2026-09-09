@@ -129,6 +129,14 @@ def parse_args(argv=None):
     parser.add_argument("--lr-ffn", type=float, default=1e-4)
     parser.add_argument("--lr-adapter", type=float, default=1e-4)
     parser.add_argument("--margin", type=float, default=1.0)
+    parser.add_argument(
+        "--normalize-embeddings",
+        action="store_true",
+        help=(
+            "L2-normalize final projected image/text embeddings immediately "
+            "before every Euclidean distance computation."
+        ),
+    )
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument(
@@ -415,6 +423,7 @@ def stage_forward(
     processor,
     device,
     margin,
+    normalize_embeddings=False,
 ):
     if stage == "ffn":
         with torch.no_grad():
@@ -442,7 +451,11 @@ def stage_forward(
                 clip_model, adapter, negative_inputs
             )
         losses[mode] = richcount_contrastive_loss(
-            image_embeddings, positive_text, negative_text, margin
+            image_embeddings,
+            positive_text,
+            negative_text,
+            margin,
+            normalize_embeddings=normalize_embeddings,
         )["loss"]
     losses["overall"] = torch.stack(
         [losses[mode] for mode in PROMPT_MODES]
@@ -508,6 +521,7 @@ def train_epoch(
             processor,
             args.device,
             args.margin,
+            args.normalize_embeddings,
         )
         losses["overall"].backward()
         assert_no_parameter_gradients(clip_model, "CLIP")
@@ -594,7 +608,14 @@ def evaluate_stage(
     negatives = {
         mode: torch.cat(negative_parts[mode], dim=0) for mode in PROMPT_MODES
     }
-    return build_stage_metrics(images, positives, negatives, classes, args.margin)
+    return build_stage_metrics(
+        images,
+        positives,
+        negatives,
+        classes,
+        args.margin,
+        normalize_embeddings=args.normalize_embeddings,
+    )
 
 
 def run_forward_smoke(
@@ -625,6 +646,7 @@ def run_forward_smoke(
         processor,
         args.device,
         args.margin,
+        args.normalize_embeddings,
     )
     stage_a["overall"].backward()
     assert_no_parameter_gradients(clip_model, "CLIP")
@@ -643,6 +665,7 @@ def run_forward_smoke(
         processor,
         args.device,
         args.margin,
+        args.normalize_embeddings,
     )
     stage_b["overall"].backward()
     assert_no_parameter_gradients(clip_model, "CLIP")
@@ -665,6 +688,11 @@ def run_forward_smoke(
 
 
 def build_configs(args, clip_path, bank, split):
+    training_distance = (
+        "l2_normalized_euclidean"
+        if args.normalize_embeddings
+        else "raw_euclidean_l2"
+    )
     research_config = {
         "experiment_name": "RichCount-inspired full-image alignment for T2ICount",
         "train_samples": args.train_samples,
@@ -681,8 +709,9 @@ def build_configs(args, clip_path, bank, split):
         "margin": args.margin,
         "dropout": args.dropout,
         "max_train_batches": args.max_train_batches,
-        "training_distance": "raw_euclidean_l2",
-        "l2_normalization": False,
+        "normalize_embeddings": args.normalize_embeddings,
+        "training_distance": training_distance,
+        "l2_normalization": args.normalize_embeddings,
         "prompt_modes": list(PROMPT_MODES),
         "best_checkpoint_criterion": "minimum_validation_overall_contrastive_loss",
     }
@@ -692,6 +721,8 @@ def build_configs(args, clip_path, bank, split):
         "prompt_bank_fingerprint": bank.file_fingerprint,
         "split_fingerprint": split.fingerprint,
         "config_fingerprint": config_fingerprint,
+        "normalize_embeddings": args.normalize_embeddings,
+        "training_distance": training_distance,
     }
     document = {
         "schema_version": 1,
@@ -762,6 +793,12 @@ def save_epoch_checkpoint(
         "trainable_state_dict": cpu_state_dict(trainable),
         "optimizer_state_dict": optimizer.state_dict(),
         "rng_state": capture_rng_state(),
+        "normalize_embeddings": config_document["research_config"][
+            "normalize_embeddings"
+        ],
+        "training_distance": config_document["research_config"][
+            "training_distance"
+        ],
         "config": config_document,
         "provenance": dict(provenance),
         "best_validation_overall_contrastive_loss": best_metric,
@@ -929,6 +966,16 @@ def main(argv=None):
         print("split_fingerprint={}".format(split.fingerprint))
         print("alignment_train_count={}".format(len(split.train_images)))
         print("alignment_validation_count={}".format(len(split.val_images)))
+        print(
+            "normalize_embeddings={}".format(
+                str(args.normalize_embeddings).lower()
+            )
+        )
+        print(
+            "training_distance={}".format(
+                config_document["research_config"]["training_distance"]
+            )
+        )
 
         if args.validate_only:
             smoke = run_forward_smoke(
@@ -1119,6 +1166,10 @@ def main(argv=None):
             },
             "provenance": provenance,
             "parameter_counts": parameter_counts,
+            "normalize_embeddings": args.normalize_embeddings,
+            "training_distance": config_document["research_config"][
+                "training_distance"
+            ],
         }
         atomic_json_write(summary, output_dir / "alignment_summary.json")
         print("Alignment training completed: {}".format(output_dir))

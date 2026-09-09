@@ -213,7 +213,20 @@ def prompt_for_mode(record, mode: str) -> str:
     raise RichAlignmentError("Unknown prompt mode: {}".format(mode))
 
 
-def richcount_contrastive_loss(image_embeddings, positive_text, negative_text, margin=1.0):
+def prepare_distance_embedding(embeddings, normalize_embeddings=False):
+    """Apply the configured convention only to final joint-space embeddings."""
+    if normalize_embeddings:
+        return F.normalize(embeddings, p=2, dim=-1, eps=1e-12)
+    return embeddings
+
+
+def richcount_contrastive_loss(
+    image_embeddings,
+    positive_text,
+    negative_text,
+    margin=1.0,
+    normalize_embeddings=False,
+):
     """Implement the balanced RichCount Euclidean contrastive objective."""
     if margin <= 0:
         raise RichAlignmentError("Contrastive margin must be greater than zero")
@@ -221,11 +234,20 @@ def richcount_contrastive_loss(image_embeddings, positive_text, negative_text, m
         raise RichAlignmentError("Positive embedding shape mismatch")
     if image_embeddings.shape != negative_text.shape:
         raise RichAlignmentError("Negative embedding shape mismatch")
+    distance_image = prepare_distance_embedding(
+        image_embeddings, normalize_embeddings
+    )
+    distance_positive = prepare_distance_embedding(
+        positive_text, normalize_embeddings
+    )
+    distance_negative = prepare_distance_embedding(
+        negative_text, normalize_embeddings
+    )
     positive_distance = torch.linalg.norm(
-        image_embeddings - positive_text, dim=-1
+        distance_image - distance_positive, dim=-1
     )
     negative_distance = torch.linalg.norm(
-        image_embeddings - negative_text, dim=-1
+        distance_image - distance_negative, dim=-1
     )
     positive_loss = torch.mean(positive_distance.pow(2))
     negative_loss = torch.mean(F.relu(margin - negative_distance).pow(2))
@@ -299,6 +321,7 @@ def compute_mode_alignment_metrics(
     class_names: Sequence[str],
     margin: float,
     retrieval_target: str,
+    normalize_embeddings: bool = False,
 ) -> Dict[str, object]:
     """Compute paired distances, cosine diagnostics, and validation R@1."""
     if image_embeddings.ndim != 2:
@@ -312,11 +335,20 @@ def compute_mode_alignment_metrics(
     if retrieval_target not in ("sample", "class"):
         raise RichAlignmentError("Unknown retrieval target: {}".format(retrieval_target))
 
+    distance_image = prepare_distance_embedding(
+        image_embeddings, normalize_embeddings
+    )
+    distance_positive = prepare_distance_embedding(
+        positive_text_embeddings, normalize_embeddings
+    )
+    distance_negative = prepare_distance_embedding(
+        negative_text_embeddings, normalize_embeddings
+    )
     positive_distance = torch.linalg.norm(
-        image_embeddings - positive_text_embeddings, dim=-1
+        distance_image - distance_positive, dim=-1
     )
     negative_distance = torch.linalg.norm(
-        image_embeddings - negative_text_embeddings, dim=-1
+        distance_image - distance_negative, dim=-1
     )
     positive_cosine = F.cosine_similarity(
         image_embeddings, positive_text_embeddings, dim=-1
@@ -324,7 +356,7 @@ def compute_mode_alignment_metrics(
     negative_cosine = F.cosine_similarity(
         image_embeddings, negative_text_embeddings, dim=-1
     )
-    retrieval_distances = torch.cdist(image_embeddings, positive_text_embeddings)
+    retrieval_distances = torch.cdist(distance_image, distance_positive)
     nearest = retrieval_distances.argmin(dim=1).tolist()
     sample_correct = [nearest[index] == index for index in range(len(nearest))]
     class_correct = [
@@ -337,6 +369,7 @@ def compute_mode_alignment_metrics(
         positive_text_embeddings,
         negative_text_embeddings,
         margin=margin,
+        normalize_embeddings=normalize_embeddings,
     )
     return {
         "sample_count": image_embeddings.shape[0],
@@ -365,6 +398,7 @@ def build_stage_metrics(
     negative_by_mode: Mapping[str, torch.Tensor],
     class_names: Sequence[str],
     margin: float,
+    normalize_embeddings: bool = False,
 ) -> Dict[str, object]:
     per_mode = {}
     for mode in PROMPT_MODES:
@@ -375,6 +409,7 @@ def build_stage_metrics(
             class_names,
             margin,
             retrieval_target="class" if mode == "class" else "sample",
+            normalize_embeddings=normalize_embeddings,
         )
     mean_fields = (
         "contrastive_loss",
@@ -416,6 +451,8 @@ def validate_resume_provenance(current: Mapping[str, object], checkpoint) -> Non
         "prompt_bank_fingerprint",
         "split_fingerprint",
         "config_fingerprint",
+        "normalize_embeddings",
+        "training_distance",
     ):
         if checkpoint_provenance.get(key) != current.get(key):
             raise RichAlignmentError(
