@@ -47,6 +47,47 @@ Relative to upstream T2ICount, this implementation adds or extends:
 These descriptions identify implementation work in this repository; they do
 not claim ownership of the original T2ICount method or upstream code.
 
+## RichCount-inspired full-image alignment
+
+`tools/train_rich_alignment.py` is a standalone Stage 1 visual-text alignment
+experiment for T2ICount. It is inspired by RichCount, but it is not an exact
+RichCount reproduction: it uses the project's local CLIP ViT-L/14 model and one
+full stored FSC147 384 image from `images_384_VarV2/` per sample. The image is
+processed only by the standard local `CLIPProcessor`; no T2ICount crop, resize,
+mosaic, flip, or prompt augmentation is used, and no visual prompts or cropped
+regions are invented.
+
+The experiment uses the exact deterministic 1000-image train subset and prompt
+bank with seed 3407, then makes a separate deterministic 900/100 alignment
+train/validation split. It first freezes all CLIP parameters and trains a
+768-dimensional visual FFN. It then freezes CLIP and the trained FFN and trains
+a residual token-wise `[B,T,768] -> [B,T,768]` text adapter. All class,
+detailed, and generalized prompts are positive pairs; deterministic negatives
+use the same prompt mode from a different FSC147 class. A different class is
+not guaranteed to be absent from an image, so these negatives may contain
+label noise.
+
+Validation compares frozen CLIP, the trained FFN, and the trained adapter on
+the held-out 100 samples. It reports positive and negative raw Euclidean
+distance, separation gap, pairwise accuracy, margin violations, cosine
+diagnostics, and Euclidean retrieval R@1. Duplicate class prompts use
+class-aware retrieval correctness. FSC-147-S is not used for training or model
+selection. This stage does not construct or train the counting model, density
+maps, RichPrompt Phase 2 loss, or DUMLO, and it makes no claim about improved
+counting performance.
+
+Validate the fixed data contract and run a real one-image/three-prompt offline
+CLIP forward without training or output writes:
+
+```bash
+export RICH_PROMPT_BANK="/path/to/fsc147_train1000_seed3407_gemma4_v3.json"
+python tools/train_rich_alignment.py \
+  --asset-root "$T2ICOUNT_ASSET_ROOT" \
+  --prompt-bank "$RICH_PROMPT_BANK" \
+  --device cpu \
+  --validate-only
+```
+
 ## Portable offline setup
 
 Clone this implementation repository:
