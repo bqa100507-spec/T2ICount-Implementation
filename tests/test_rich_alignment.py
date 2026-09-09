@@ -1,4 +1,6 @@
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 import torch.nn as nn
@@ -10,6 +12,9 @@ from utils.rich_alignment import (
     build_alignment_split,
     build_negative_indices,
     build_stage_metrics,
+    compute_alignment_distances,
+    compute_distance_diagnostics,
+    compute_distance_distribution,
     compute_mode_alignment_metrics,
     configure_stage_a,
     configure_stage_b,
@@ -18,7 +23,11 @@ from utils.rich_alignment import (
     richcount_contrastive_loss,
     validate_resume_provenance,
 )
-from tools.train_rich_alignment import parse_args
+from tools.train_rich_alignment import (
+    build_stage0_diagnostics_document,
+    parse_args,
+    run_stage0_diagnostics_only,
+)
 
 
 class NormalizationFlagTests(unittest.TestCase):
@@ -28,6 +37,12 @@ class NormalizationFlagTests(unittest.TestCase):
     def test_flag_enables_normalization(self):
         self.assertTrue(
             parse_args(["--normalize-embeddings"]).normalize_embeddings
+        )
+
+    def test_stage0_diagnostics_only_flag_defaults_off_and_is_opt_in(self):
+        self.assertFalse(parse_args([]).stage0_diagnostics_only)
+        self.assertTrue(
+            parse_args(["--stage0-diagnostics-only"]).stage0_diagnostics_only
         )
 
 
@@ -252,6 +267,74 @@ class ModuleAndFreezeTests(unittest.TestCase):
 
 
 class MetricTests(unittest.TestCase):
+    def test_distance_distribution_uses_torch_quantiles_on_toy_values(self):
+        distances = torch.tensor([0.0, 1.0, 2.0, 3.0, 4.0])
+        distribution = compute_distance_distribution(distances)
+
+        self.assertEqual(
+            set(distribution),
+            {
+                "min",
+                "p01",
+                "p05",
+                "p10",
+                "p25",
+                "median",
+                "p75",
+                "p90",
+                "p95",
+                "p99",
+                "max",
+                "mean",
+                "std",
+            },
+        )
+        expected_quantiles = torch.quantile(
+            distances,
+            torch.tensor([0.01, 0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95, 0.99]),
+        )
+        for key, expected in zip(
+            ("p01", "p05", "p10", "p25", "median", "p75", "p90", "p95", "p99"),
+            expected_quantiles,
+        ):
+            self.assertEqual(distribution[key], expected.item())
+        self.assertEqual(distribution["min"], 0.0)
+        self.assertEqual(distribution["max"], 4.0)
+        self.assertEqual(distribution["mean"], 2.0)
+        self.assertAlmostEqual(distribution["std"], 2.0 ** 0.5)
+
+    def test_negative_thresholds_and_margin_use_strict_less_than(self):
+        diagnostics = compute_distance_diagnostics(
+            torch.zeros(6),
+            torch.tensor([0.8, 0.9, 1.0, 1.2, 1.25, 1.5]),
+            margin=1.2,
+        )
+
+        self.assertEqual(diagnostics["fraction_below_0_8"], 0.0)
+        self.assertAlmostEqual(diagnostics["fraction_below_0_9"], 1.0 / 6.0)
+        self.assertAlmostEqual(diagnostics["fraction_below_1_0"], 2.0 / 6.0)
+        self.assertAlmostEqual(diagnostics["fraction_below_1_2"], 3.0 / 6.0)
+        self.assertAlmostEqual(diagnostics["fraction_below_1_25"], 4.0 / 6.0)
+        self.assertAlmostEqual(diagnostics["fraction_below_1_5"], 5.0 / 6.0)
+        self.assertEqual(diagnostics["negative_count_below_margin"], 3)
+        self.assertAlmostEqual(
+            diagnostics["negative_fraction_below_margin"], 3.0 / 6.0
+        )
+
+    def test_diagnostic_loss_components_match_training_formula(self):
+        positive = torch.tensor([1.0, 2.0])
+        negative = torch.tensor([0.5, 2.0])
+        diagnostics = compute_distance_diagnostics(positive, negative, margin=1.0)
+
+        expected_positive = (1.0 ** 2 + 2.0 ** 2) / 2.0
+        expected_negative = ((1.0 - 0.5) ** 2 + 0.0) / 2.0
+        expected_total = 0.5 * (expected_positive + expected_negative)
+        self.assertAlmostEqual(diagnostics["positive_loss"], expected_positive)
+        self.assertAlmostEqual(diagnostics["negative_loss"], expected_negative)
+        self.assertAlmostEqual(
+            diagnostics["total_contrastive_loss"], expected_total
+        )
+
     def test_alignment_metrics_match_toy_values(self):
         images = torch.tensor([[0.0, 0.0], [2.0, 0.0]])
         positives = torch.tensor([[0.0, 0.0], [3.0, 0.0]])
@@ -325,6 +408,47 @@ class MetricTests(unittest.TestCase):
         self.assertEqual(normalized["retrieval_r_at_1"], 1.0)
         self.assertEqual(normalized["pairwise_alignment_accuracy"], 1.0)
 
+    def test_raw_and_normalized_metrics_share_distance_diagnostics_path(self):
+        images = torch.tensor([[2.0, 0.0], [0.0, 3.0]])
+        positives = torch.tensor([[4.0, 0.0], [0.0, 1.0]])
+        negatives = positives.flip(0)
+        with patch(
+            "utils.rich_alignment.compute_alignment_distances",
+            wraps=compute_alignment_distances,
+        ) as shared_distances:
+            raw = compute_mode_alignment_metrics(
+                images,
+                positives,
+                negatives,
+                ["a", "b"],
+                margin=1.0,
+                retrieval_target="sample",
+                normalize_embeddings=False,
+            )
+            normalized = compute_mode_alignment_metrics(
+                images,
+                positives,
+                negatives,
+                ["a", "b"],
+                margin=1.0,
+                retrieval_target="sample",
+                normalize_embeddings=True,
+            )
+
+        self.assertEqual(shared_distances.call_count, 2)
+        for metrics in (raw, normalized):
+            self.assertEqual(
+                metrics["positive_distance_distribution"]["mean"],
+                metrics["mean_positive_euclidean_distance"],
+            )
+            self.assertEqual(
+                metrics["negative_distance_distribution"]["mean"],
+                metrics["mean_negative_euclidean_distance"],
+            )
+            self.assertEqual(
+                metrics["total_contrastive_loss"], metrics["contrastive_loss"]
+            )
+
     def test_stage_metrics_have_required_layout(self):
         embeddings = torch.eye(3)
         by_mode = {
@@ -340,6 +464,116 @@ class MetricTests(unittest.TestCase):
         )
         self.assertEqual(
             set(metrics), {"overall", "class", "detailed", "generalized"}
+        )
+
+    def test_overall_distribution_concatenates_all_mode_distances(self):
+        images = torch.zeros(2, 1)
+        positives = {
+            "class": torch.tensor([[0.0], [2.0]]),
+            "detailed": torch.tensor([[4.0], [6.0]]),
+            "generalized": torch.tensor([[8.0], [10.0]]),
+        }
+        negatives = {mode: value + 20.0 for mode, value in positives.items()}
+        metrics = build_stage_metrics(
+            images, positives, negatives, ["a", "b"], margin=1.0
+        )
+
+        overall = metrics["overall"]
+        self.assertEqual(
+            overall["distance_distribution_aggregation"],
+            "concatenated_class_detailed_generalized_distance_tensors",
+        )
+        self.assertEqual(overall["positive_distance_distribution"]["mean"], 5.0)
+        self.assertEqual(overall["positive_distance_distribution"]["median"], 5.0)
+        self.assertEqual(overall["sample_count"], 6)
+
+    def test_stage_metrics_are_deterministic_for_deterministic_toy_input(self):
+        images = torch.eye(3)
+        positives = {
+            "class": images,
+            "detailed": images.roll(1, 0),
+            "generalized": images.roll(2, 0),
+        }
+        negatives = {mode: value.flip(0) for mode, value in positives.items()}
+
+        first = build_stage_metrics(
+            images, positives, negatives, ["a", "b", "c"], margin=1.2
+        )
+        second = build_stage_metrics(
+            images, positives, negatives, ["a", "b", "c"], margin=1.2
+        )
+        self.assertEqual(first, second)
+
+
+class Stage0DiagnosticsOnlyTests(unittest.TestCase):
+    @staticmethod
+    def _stage_metrics():
+        embeddings = torch.eye(3)
+        positives = {mode: embeddings for mode in ("class", "detailed", "generalized")}
+        negatives = {mode: embeddings.roll(1, 0) for mode in positives}
+        return build_stage_metrics(
+            embeddings, positives, negatives, ["a", "b", "c"], margin=1.2
+        )
+
+    @staticmethod
+    def _provenance():
+        return {
+            "source_subset_fingerprint": "subset",
+            "prompt_bank_fingerprint": "bank",
+            "split_fingerprint": "split",
+            "config_fingerprint": "config",
+        }
+
+    def test_stage0_diagnostics_only_evaluates_clip_validation_without_training(self):
+        args = SimpleNamespace(
+            margin=1.2,
+            normalize_embeddings=True,
+            output_dir=None,
+        )
+        split = SimpleNamespace(val_images=("v1.jpg", "v2.jpg", "v3.jpg"))
+        with patch(
+            "tools.train_rich_alignment.evaluate_stage",
+            return_value=self._stage_metrics(),
+        ) as evaluate, patch(
+            "tools.train_rich_alignment.train_stage"
+        ) as train, patch(
+            "tools.train_rich_alignment.torch.optim.Adam"
+        ) as optimizer:
+            document = run_stage0_diagnostics_only(
+                object(),
+                object(),
+                object(),
+                object(),
+                split,
+                object(),
+                object(),
+                object(),
+                args,
+                self._provenance(),
+            )
+
+        self.assertEqual(evaluate.call_args.args[0], "clip")
+        self.assertEqual(evaluate.call_args.args[5], list(split.val_images))
+        train.assert_not_called()
+        optimizer.assert_not_called()
+        self.assertEqual(document["sample_count"], 3)
+        self.assertTrue(document["normalize_embeddings"])
+        self.assertEqual(document["training_distance"], "l2_normalized_euclidean")
+
+    def test_diagnostics_document_is_deterministic(self):
+        args = SimpleNamespace(margin=1.2, normalize_embeddings=False)
+        metrics = self._stage_metrics()
+        first = build_stage0_diagnostics_document(
+            metrics, args, self._provenance(), 3
+        )
+        second = build_stage0_diagnostics_document(
+            metrics, args, self._provenance(), 3
+        )
+        self.assertEqual(first, second)
+        self.assertEqual(first["training_distance"], "raw_euclidean_l2")
+        self.assertEqual(
+            first["overall_distribution_aggregation"],
+            "concatenated_class_detailed_generalized_distance_tensors",
         )
 
 

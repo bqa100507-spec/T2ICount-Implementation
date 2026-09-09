@@ -146,6 +146,14 @@ def parse_args(argv=None):
     parser.add_argument("--resume")
     parser.add_argument("--validate-only", action="store_true")
     parser.add_argument(
+        "--stage0-diagnostics-only",
+        action="store_true",
+        help=(
+            "Evaluate frozen-CLIP Stage 0 distance distributions on the fixed "
+            "100-image validation split, then exit without training."
+        ),
+    )
+    parser.add_argument(
         "--max-train-batches",
         type=int,
         default=0,
@@ -180,7 +188,15 @@ def validate_args(args):
             "Alignment checkpoints are required every epoch; "
             "--checkpoint-interval must be 1"
         )
-    if not args.validate_only and not args.output_dir:
+    if args.validate_only and args.stage0_diagnostics_only:
+        raise RichAlignmentError(
+            "--validate-only and --stage0-diagnostics-only are mutually exclusive"
+        )
+    if (
+        not args.validate_only
+        and not args.stage0_diagnostics_only
+        and not args.output_dir
+    ):
         raise RichAlignmentError("--output-dir is required for training")
 
 
@@ -901,6 +917,123 @@ def train_stage(
     return best_metric, best_epoch, best_state
 
 
+def build_stage0_diagnostics_document(
+    stage0_metrics, args, provenance, validation_sample_count
+):
+    training_distance = (
+        "l2_normalized_euclidean"
+        if args.normalize_embeddings
+        else "raw_euclidean_l2"
+    )
+    return {
+        "schema_version": 1,
+        "diagnostic": "frozen_clip_stage0_distance_distribution",
+        "margin": args.margin,
+        "normalize_embeddings": args.normalize_embeddings,
+        "training_distance": training_distance,
+        "sample_count": validation_sample_count,
+        "provenance_fingerprints": {
+            key: provenance[key]
+            for key in (
+                "source_subset_fingerprint",
+                "prompt_bank_fingerprint",
+                "split_fingerprint",
+                "config_fingerprint",
+            )
+        },
+        "per_mode_diagnostics": {
+            mode: stage0_metrics[mode] for mode in PROMPT_MODES
+        },
+        "overall_diagnostics": stage0_metrics["overall"],
+        "overall_distribution_aggregation": (
+            "concatenated_class_detailed_generalized_distance_tensors"
+        ),
+        "standard_deviation_convention": "population_std_unbiased_false",
+    }
+
+
+def print_stage0_diagnostics_summary(document):
+    print("Stage 0 distance diagnostics (frozen CLIP validation only)")
+    print(
+        "mode | d_pos mean/min/p25/median/p75/max | "
+        "d_neg mean/min/p25/median/p75/max | frac d_neg < margin | "
+        "negative_loss | pairwise accuracy | retrieval R@1"
+    )
+    rows = list(PROMPT_MODES) + ["overall"]
+    for mode in rows:
+        metrics = (
+            document["overall_diagnostics"]
+            if mode == "overall"
+            else document["per_mode_diagnostics"][mode]
+        )
+        positive = metrics["positive_distance_distribution"]
+        negative = metrics["negative_distance_distribution"]
+        print(
+            "{} | {:.6f}/{:.6f}/{:.6f}/{:.6f}/{:.6f}/{:.6f} | "
+            "{:.6f}/{:.6f}/{:.6f}/{:.6f}/{:.6f}/{:.6f} | "
+            "{:.6f} | {:.12g} | {:.6f} | {:.6f}".format(
+                mode,
+                positive["mean"],
+                positive["min"],
+                positive["p25"],
+                positive["median"],
+                positive["p75"],
+                positive["max"],
+                negative["mean"],
+                negative["min"],
+                negative["p25"],
+                negative["median"],
+                negative["p75"],
+                negative["max"],
+                metrics["negative_fraction_below_margin"],
+                metrics["negative_loss"],
+                metrics["pairwise_alignment_accuracy"],
+                metrics["retrieval_r_at_1"],
+            )
+        )
+
+
+def run_stage0_diagnostics_only(
+    clip_model,
+    ffn,
+    adapter,
+    image_root,
+    split,
+    bank,
+    class_by_image,
+    processor,
+    args,
+    provenance,
+):
+    val_names = list(split.val_images)
+    stage0_metrics = evaluate_stage(
+        "clip",
+        clip_model,
+        ffn,
+        adapter,
+        image_root,
+        val_names,
+        bank,
+        class_by_image,
+        processor,
+        args,
+    )
+    document = build_stage0_diagnostics_document(
+        stage0_metrics, args, provenance, len(val_names)
+    )
+    print_stage0_diagnostics_summary(document)
+    if args.output_dir:
+        output_dir = Path(args.output_dir).expanduser().absolute()
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_path = output_dir / "stage0_distance_diagnostics.json"
+        atomic_json_write(document, output_path)
+        print("stage0_distance_diagnostics={}".format(output_path))
+    print(
+        "Stage-0 diagnostics completed without FFN/adapter training or optimizer state."
+    )
+    return document
+
+
 def main(argv=None):
     args = parse_args(argv)
     try:
@@ -990,6 +1123,21 @@ def main(argv=None):
             )
             print("forward_smoke={}".format(json.dumps(smoke, sort_keys=True)))
             print("Validation-only completed without training or output writes.")
+            return 0
+
+        if args.stage0_diagnostics_only:
+            run_stage0_diagnostics_only(
+                clip_model,
+                ffn,
+                adapter,
+                image_root,
+                split,
+                bank,
+                class_by_image,
+                processor,
+                args,
+                provenance,
+            )
             return 0
 
         output_dir = Path(args.output_dir).expanduser().absolute()

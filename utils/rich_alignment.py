@@ -15,6 +15,30 @@ import torch.nn.functional as F
 
 
 PROMPT_MODES = ("class", "detailed", "generalized")
+DISTANCE_QUANTILES = (
+    ("p01", 0.01),
+    ("p05", 0.05),
+    ("p10", 0.10),
+    ("p25", 0.25),
+    ("median", 0.50),
+    ("p75", 0.75),
+    ("p90", 0.90),
+    ("p95", 0.95),
+    ("p99", 0.99),
+)
+NEGATIVE_DISTANCE_THRESHOLDS = (
+    ("fraction_below_0_8", 0.8),
+    ("fraction_below_0_9", 0.9),
+    ("fraction_below_1_0", 1.0),
+    ("fraction_below_1_1", 1.1),
+    ("fraction_below_1_2", 1.2),
+    ("fraction_below_1_25", 1.25),
+    ("fraction_below_1_3", 1.3),
+    ("fraction_below_1_35", 1.35),
+    ("fraction_below_1_4", 1.4),
+    ("fraction_below_1_45", 1.45),
+    ("fraction_below_1_5", 1.5),
+)
 EXPECTED_SUBSET_FINGERPRINT = (
     "sha256:dd96b36bf15013e194b1a8ece06452a19822aae028fc00c0de019cbb7a311f24"
 )
@@ -220,16 +244,13 @@ def prepare_distance_embedding(embeddings, normalize_embeddings=False):
     return embeddings
 
 
-def richcount_contrastive_loss(
+def compute_alignment_distances(
     image_embeddings,
     positive_text,
     negative_text,
-    margin=1.0,
     normalize_embeddings=False,
 ):
-    """Implement the balanced RichCount Euclidean contrastive objective."""
-    if margin <= 0:
-        raise RichAlignmentError("Contrastive margin must be greater than zero")
+    """Return prepared embeddings and paired distances for loss and metrics."""
     if image_embeddings.shape != positive_text.shape:
         raise RichAlignmentError("Positive embedding shape mismatch")
     if image_embeddings.shape != negative_text.shape:
@@ -249,10 +270,117 @@ def richcount_contrastive_loss(
     negative_distance = torch.linalg.norm(
         distance_image - distance_negative, dim=-1
     )
+    return (
+        distance_image,
+        distance_positive,
+        distance_negative,
+        positive_distance,
+        negative_distance,
+    )
+
+
+def _contrastive_loss_components(positive_distance, negative_distance, margin):
+    if margin <= 0:
+        raise RichAlignmentError("Contrastive margin must be greater than zero")
+    if positive_distance.shape != negative_distance.shape:
+        raise RichAlignmentError("Positive/negative distance shape mismatch")
+    if positive_distance.numel() == 0:
+        raise RichAlignmentError("Contrastive distances must not be empty")
     positive_loss = torch.mean(positive_distance.pow(2))
     negative_loss = torch.mean(F.relu(margin - negative_distance).pow(2))
+    total_loss = 0.5 * (positive_loss + negative_loss)
+    return positive_loss, negative_loss, total_loss
+
+
+def compute_distance_distribution(distances) -> Dict[str, float]:
+    """Summarize one actual distance tensor with Torch quantiles."""
+    values = distances.reshape(-1)
+    if values.numel() == 0:
+        raise RichAlignmentError("Distance distribution must not be empty")
+    quantile_values = torch.quantile(
+        values,
+        values.new_tensor([quantile for _, quantile in DISTANCE_QUANTILES]),
+    )
+    distribution = {"min": float(values.min().item())}
+    distribution.update(
+        {
+            name: float(value.item())
+            for (name, _), value in zip(DISTANCE_QUANTILES, quantile_values)
+        }
+    )
+    distribution.update(
+        {
+            "max": float(values.max().item()),
+            "mean": float(values.mean().item()),
+            "std": float(values.std(unbiased=False).item()),
+        }
+    )
+    return distribution
+
+
+def compute_distance_diagnostics(
+    positive_distance, negative_distance, margin
+) -> Dict[str, object]:
+    """Compute distributions, strict thresholds, and shared loss components."""
+    positive_values = positive_distance.reshape(-1)
+    negative_values = negative_distance.reshape(-1)
+    positive_loss, negative_loss, total_loss = _contrastive_loss_components(
+        positive_values, negative_values, margin
+    )
+    diagnostics = {
+        "positive_distance_distribution": compute_distance_distribution(
+            positive_values
+        ),
+        "negative_distance_distribution": compute_distance_distribution(
+            negative_values
+        ),
+    }
+    diagnostics.update(
+        {
+            name: float((negative_values < threshold).float().mean().item())
+            for name, threshold in NEGATIVE_DISTANCE_THRESHOLDS
+        }
+    )
+    below_margin = negative_values < margin
+    diagnostics.update(
+        {
+            "negative_count_below_margin": int(below_margin.sum().item()),
+            "negative_fraction_below_margin": float(
+                below_margin.float().mean().item()
+            ),
+            "positive_loss": float(positive_loss.item()),
+            "negative_loss": float(negative_loss.item()),
+            "total_contrastive_loss": float(total_loss.item()),
+        }
+    )
+    return diagnostics
+
+
+def richcount_contrastive_loss(
+    image_embeddings,
+    positive_text,
+    negative_text,
+    margin=1.0,
+    normalize_embeddings=False,
+):
+    """Implement the balanced RichCount Euclidean contrastive objective."""
+    (
+        _,
+        _,
+        _,
+        positive_distance,
+        negative_distance,
+    ) = compute_alignment_distances(
+        image_embeddings,
+        positive_text,
+        negative_text,
+        normalize_embeddings=normalize_embeddings,
+    )
+    positive_loss, negative_loss, total_loss = _contrastive_loss_components(
+        positive_distance, negative_distance, margin
+    )
     return {
-        "loss": 0.5 * (positive_loss + negative_loss),
+        "loss": total_loss,
         "positive_loss": positive_loss,
         "negative_loss": negative_loss,
         "positive_distance": positive_distance,
@@ -314,7 +442,7 @@ def assert_parameter_gradients(module, label):
         raise RuntimeError("{} did not receive gradients".format(label))
 
 
-def compute_mode_alignment_metrics(
+def _compute_mode_alignment_metrics_and_distances(
     image_embeddings,
     positive_text_embeddings,
     negative_text_embeddings,
@@ -322,7 +450,7 @@ def compute_mode_alignment_metrics(
     margin: float,
     retrieval_target: str,
     normalize_embeddings: bool = False,
-) -> Dict[str, object]:
+):
     """Compute paired distances, cosine diagnostics, and validation R@1."""
     if image_embeddings.ndim != 2:
         raise RichAlignmentError("Metric image embeddings must be [N,D]")
@@ -335,20 +463,17 @@ def compute_mode_alignment_metrics(
     if retrieval_target not in ("sample", "class"):
         raise RichAlignmentError("Unknown retrieval target: {}".format(retrieval_target))
 
-    distance_image = prepare_distance_embedding(
-        image_embeddings, normalize_embeddings
-    )
-    distance_positive = prepare_distance_embedding(
-        positive_text_embeddings, normalize_embeddings
-    )
-    distance_negative = prepare_distance_embedding(
-        negative_text_embeddings, normalize_embeddings
-    )
-    positive_distance = torch.linalg.norm(
-        distance_image - distance_positive, dim=-1
-    )
-    negative_distance = torch.linalg.norm(
-        distance_image - distance_negative, dim=-1
+    (
+        distance_image,
+        distance_positive,
+        _,
+        positive_distance,
+        negative_distance,
+    ) = compute_alignment_distances(
+        image_embeddings,
+        positive_text_embeddings,
+        negative_text_embeddings,
+        normalize_embeddings=normalize_embeddings,
     )
     positive_cosine = F.cosine_similarity(
         image_embeddings, positive_text_embeddings, dim=-1
@@ -364,16 +489,12 @@ def compute_mode_alignment_metrics(
         for index in range(len(nearest))
     ]
     primary = class_correct if retrieval_target == "class" else sample_correct
-    contrastive = richcount_contrastive_loss(
-        image_embeddings,
-        positive_text_embeddings,
-        negative_text_embeddings,
-        margin=margin,
-        normalize_embeddings=normalize_embeddings,
+    diagnostics = compute_distance_diagnostics(
+        positive_distance, negative_distance, margin
     )
-    return {
+    metrics = {
         "sample_count": image_embeddings.shape[0],
-        "contrastive_loss": float(contrastive["loss"].item()),
+        "contrastive_loss": diagnostics["total_contrastive_loss"],
         "mean_positive_euclidean_distance": float(positive_distance.mean().item()),
         "mean_negative_euclidean_distance": float(negative_distance.mean().item()),
         "separation_gap": float((negative_distance - positive_distance).mean().item()),
@@ -390,6 +511,29 @@ def compute_mode_alignment_metrics(
         "retrieval_class_aware_r_at_1": sum(class_correct) / len(class_correct),
         "retrieval_target": retrieval_target,
     }
+    metrics.update(diagnostics)
+    return metrics, positive_distance, negative_distance
+
+
+def compute_mode_alignment_metrics(
+    image_embeddings,
+    positive_text_embeddings,
+    negative_text_embeddings,
+    class_names: Sequence[str],
+    margin: float,
+    retrieval_target: str,
+    normalize_embeddings: bool = False,
+) -> Dict[str, object]:
+    metrics, _, _ = _compute_mode_alignment_metrics_and_distances(
+        image_embeddings,
+        positive_text_embeddings,
+        negative_text_embeddings,
+        class_names,
+        margin,
+        retrieval_target,
+        normalize_embeddings=normalize_embeddings,
+    )
+    return metrics
 
 
 def build_stage_metrics(
@@ -401,16 +545,23 @@ def build_stage_metrics(
     normalize_embeddings: bool = False,
 ) -> Dict[str, object]:
     per_mode = {}
+    positive_distances = []
+    negative_distances = []
     for mode in PROMPT_MODES:
-        per_mode[mode] = compute_mode_alignment_metrics(
-            image_embeddings,
-            positive_by_mode[mode],
-            negative_by_mode[mode],
-            class_names,
-            margin,
-            retrieval_target="class" if mode == "class" else "sample",
-            normalize_embeddings=normalize_embeddings,
+        metrics, positive_distance, negative_distance = (
+            _compute_mode_alignment_metrics_and_distances(
+                image_embeddings,
+                positive_by_mode[mode],
+                negative_by_mode[mode],
+                class_names,
+                margin,
+                retrieval_target="class" if mode == "class" else "sample",
+                normalize_embeddings=normalize_embeddings,
+            )
         )
+        per_mode[mode] = metrics
+        positive_distances.append(positive_distance)
+        negative_distances.append(negative_distance)
     mean_fields = (
         "contrastive_loss",
         "mean_positive_euclidean_distance",
@@ -432,6 +583,16 @@ def build_stage_metrics(
         overall[field] = sum(per_mode[mode][field] for mode in PROMPT_MODES) / len(
             PROMPT_MODES
         )
+    overall.update(
+        compute_distance_diagnostics(
+            torch.cat(positive_distances, dim=0),
+            torch.cat(negative_distances, dim=0),
+            margin,
+        )
+    )
+    overall["distance_distribution_aggregation"] = (
+        "concatenated_class_detailed_generalized_distance_tensors"
+    )
     return {
         "overall": overall,
         "class": per_mode["class"],
