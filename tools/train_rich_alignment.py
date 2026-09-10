@@ -154,6 +154,14 @@ def parse_args(argv=None):
         ),
     )
     parser.add_argument(
+        "--init-diagnostics-only",
+        action="store_true",
+        help=(
+            "Evaluate frozen CLIP and the same randomly initialized visual "
+            "FFN used by training, then exit before optimizer creation."
+        ),
+    )
+    parser.add_argument(
         "--max-train-batches",
         type=int,
         default=0,
@@ -188,13 +196,23 @@ def validate_args(args):
             "Alignment checkpoints are required every epoch; "
             "--checkpoint-interval must be 1"
         )
-    if args.validate_only and args.stage0_diagnostics_only:
+    diagnostic_modes = sum(
+        bool(enabled)
+        for enabled in (
+            args.validate_only,
+            args.stage0_diagnostics_only,
+            args.init_diagnostics_only,
+        )
+    )
+    if diagnostic_modes > 1:
         raise RichAlignmentError(
-            "--validate-only and --stage0-diagnostics-only are mutually exclusive"
+            "--validate-only, --stage0-diagnostics-only, and "
+            "--init-diagnostics-only are mutually exclusive"
         )
     if (
         not args.validate_only
         and not args.stage0_diagnostics_only
+        and not args.init_diagnostics_only
         and not args.output_dir
     ):
         raise RichAlignmentError("--output-dir is required for training")
@@ -1034,6 +1052,117 @@ def run_stage0_diagnostics_only(
     return document
 
 
+def capture_parameter_state(module):
+    return {
+        name: parameter.detach().cpu().clone()
+        for name, parameter in module.named_parameters()
+    }
+
+
+def assert_parameter_state_unchanged(module, before, label):
+    after = dict(module.named_parameters())
+    if set(after) != set(before):
+        raise RuntimeError("{} parameter names changed during evaluation".format(label))
+    for name, expected in before.items():
+        actual = after[name].detach().cpu()
+        if not torch.equal(expected, actual):
+            raise RuntimeError(
+                "{} parameter changed during evaluation: {}".format(label, name)
+            )
+
+
+def evaluate_initialization_stage(
+    metric_stage,
+    evaluation_stage,
+    module,
+    clip_model,
+    ffn,
+    adapter,
+    image_root,
+    val_names,
+    bank,
+    class_by_image,
+    processor,
+    args,
+):
+    expected_module = ffn if evaluation_stage == "ffn" else adapter
+    if evaluation_stage not in ("ffn", "adapter") or module is not expected_module:
+        raise RichAlignmentError(
+            "{} must evaluate the same {} instance used by training".format(
+                metric_stage, evaluation_stage
+            )
+        )
+    before = capture_parameter_state(module)
+    metrics = evaluate_stage(
+        evaluation_stage,
+        clip_model,
+        ffn,
+        adapter,
+        image_root,
+        val_names,
+        bank,
+        class_by_image,
+        processor,
+        args,
+    )
+    assert_parameter_state_unchanged(module, before, metric_stage)
+    return metrics
+
+
+def run_init_diagnostics_only(
+    clip_model,
+    ffn,
+    adapter,
+    image_root,
+    split,
+    bank,
+    class_by_image,
+    processor,
+    args,
+    output_dir=None,
+):
+    val_names = list(split.val_images)
+    stage0_clip = evaluate_stage(
+        "clip",
+        clip_model,
+        ffn,
+        adapter,
+        image_root,
+        val_names,
+        bank,
+        class_by_image,
+        processor,
+        args,
+    )
+    stage0_ffn_init = evaluate_initialization_stage(
+        "stage0_ffn_init",
+        "ffn",
+        ffn,
+        clip_model,
+        ffn,
+        adapter,
+        image_root,
+        val_names,
+        bank,
+        class_by_image,
+        processor,
+        args,
+    )
+    if output_dir is not None:
+        atomic_json_write(
+            {"stage0_clip": stage0_clip}, output_dir / "stage0_clip_metrics.json"
+        )
+        atomic_json_write(
+            {"stage0_ffn_init": stage0_ffn_init},
+            output_dir / "stage0_ffn_init_metrics.json",
+        )
+    print("Initialization diagnostics completed before optimizer creation or training.")
+    return {
+        "stage0_clip": stage0_clip,
+        "stage0_ffn_init": stage0_ffn_init,
+    }
+
+
 def main(argv=None):
     args = parse_args(argv)
     try:
@@ -1140,6 +1269,31 @@ def main(argv=None):
             )
             return 0
 
+        if args.init_diagnostics_only:
+            output_dir = None
+            if args.output_dir:
+                output_dir = Path(args.output_dir).expanduser().absolute()
+                output_dir.mkdir(parents=True, exist_ok=True)
+                atomic_json_write(
+                    config_document, output_dir / "alignment_config.json"
+                )
+                atomic_json_write(
+                    split_manifest, output_dir / "alignment_split_manifest.json"
+                )
+            run_init_diagnostics_only(
+                clip_model,
+                ffn,
+                adapter,
+                image_root,
+                split,
+                bank,
+                class_by_image,
+                processor,
+                args,
+                output_dir=output_dir,
+            )
+            return 0
+
         output_dir = Path(args.output_dir).expanduser().absolute()
         output_dir.mkdir(parents=True, exist_ok=True)
         atomic_json_write(config_document, output_dir / "alignment_config.json")
@@ -1162,6 +1316,24 @@ def main(argv=None):
         )
         atomic_json_write(
             {"stage0_clip": stage0}, output_dir / "stage0_clip_metrics.json"
+        )
+        stage0_ffn_init = evaluate_initialization_stage(
+            "stage0_ffn_init",
+            "ffn",
+            ffn,
+            clip_model,
+            ffn,
+            adapter,
+            image_root,
+            val_names,
+            bank,
+            class_by_image,
+            processor,
+            args,
+        )
+        atomic_json_write(
+            {"stage0_ffn_init": stage0_ffn_init},
+            output_dir / "stage0_ffn_init_metrics.json",
         )
 
         resume_checkpoint = None
@@ -1230,6 +1402,25 @@ def main(argv=None):
         )
         atomic_json_write(
             {"stage1_ffn": stage1}, output_dir / "stage1_ffn_metrics.json"
+        )
+        configure_stage_b(clip_model, ffn, adapter)
+        stage1_adapter_init = evaluate_initialization_stage(
+            "stage1_adapter_init",
+            "adapter",
+            adapter,
+            clip_model,
+            ffn,
+            adapter,
+            image_root,
+            val_names,
+            bank,
+            class_by_image,
+            processor,
+            args,
+        )
+        atomic_json_write(
+            {"stage1_adapter_init": stage1_adapter_init},
+            output_dir / "stage1_adapter_init_metrics.json",
         )
 
         adapter_start = 0
@@ -1300,7 +1491,9 @@ def main(argv=None):
         )
         summary = {
             "stage0_clip": stage0,
+            "stage0_ffn_init": stage0_ffn_init,
             "stage1_ffn": stage1,
+            "stage1_adapter_init": stage1_adapter_init,
             "stage2_adapter": stage2,
             "best_checkpoints": {
                 "ffn": {

@@ -1,4 +1,6 @@
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -25,8 +27,12 @@ from utils.rich_alignment import (
 )
 from tools.train_rich_alignment import (
     build_stage0_diagnostics_document,
+    capture_parameter_state,
+    main as alignment_main,
     parse_args,
+    run_init_diagnostics_only,
     run_stage0_diagnostics_only,
+    validate_args,
 )
 
 
@@ -44,6 +50,20 @@ class NormalizationFlagTests(unittest.TestCase):
         self.assertTrue(
             parse_args(["--stage0-diagnostics-only"]).stage0_diagnostics_only
         )
+
+    def test_init_diagnostics_only_flag_defaults_off_and_is_opt_in(self):
+        self.assertFalse(parse_args([]).init_diagnostics_only)
+        self.assertTrue(
+            parse_args(["--init-diagnostics-only"]).init_diagnostics_only
+        )
+
+    def test_diagnostic_only_modes_are_mutually_exclusive(self):
+        with self.assertRaisesRegex(RichAlignmentError, "mutually exclusive"):
+            validate_args(
+                parse_args(
+                    ["--stage0-diagnostics-only", "--init-diagnostics-only"]
+                )
+            )
 
 
 class ContrastiveLossTests(unittest.TestCase):
@@ -574,6 +594,253 @@ class Stage0DiagnosticsOnlyTests(unittest.TestCase):
         self.assertEqual(
             first["overall_distribution_aggregation"],
             "concatenated_class_detailed_generalized_distance_tensors",
+        )
+
+
+class InitializationDiagnosticsTests(unittest.TestCase):
+    @staticmethod
+    def _parameters_match(module, expected):
+        actual = dict(module.named_parameters())
+        return set(actual) == set(expected) and all(
+            torch.equal(value, actual[name].detach().cpu())
+            for name, value in expected.items()
+        )
+
+    def test_init_diagnostics_only_uses_same_unchanged_ffn_without_optimizer(self):
+        ffn = VisualAlignmentFFN(embedding_dim=2, dropout=0.0)
+        adapter = TokenTextAdapter(embedding_dim=2, dropout=0.0)
+        initial_ffn = capture_parameter_state(ffn)
+        args = SimpleNamespace(output_dir=None)
+        split = SimpleNamespace(val_images=("v1.jpg", "v2.jpg"))
+        metrics = {"overall": {"contrastive_loss": 1.0}}
+
+        def evaluate(stage, clip_arg, ffn_arg, adapter_arg, *unused):
+            self.assertIs(ffn_arg, ffn)
+            self.assertIs(adapter_arg, adapter)
+            return metrics
+
+        with patch(
+            "tools.train_rich_alignment.evaluate_stage", side_effect=evaluate
+        ) as evaluate_mock, patch(
+            "tools.train_rich_alignment.train_stage"
+        ) as train, patch(
+            "tools.train_rich_alignment.torch.optim.Adam"
+        ) as optimizer:
+            result = run_init_diagnostics_only(
+                object(),
+                ffn,
+                adapter,
+                object(),
+                split,
+                object(),
+                object(),
+                object(),
+                args,
+            )
+
+        self.assertEqual(
+            [call.args[0] for call in evaluate_mock.call_args_list],
+            ["clip", "ffn"],
+        )
+        self.assertTrue(self._parameters_match(ffn, initial_ffn))
+        self.assertEqual(set(result), {"stage0_clip", "stage0_ffn_init"})
+        train.assert_not_called()
+        optimizer.assert_not_called()
+
+    def test_normal_path_evaluates_init_parameters_before_same_modules_train(self):
+        events = []
+        ffn = VisualAlignmentFFN(embedding_dim=2, dropout=0.0)
+        adapter = TokenTextAdapter(embedding_dim=2, dropout=0.0)
+        initial_ffn = capture_parameter_state(ffn)
+        initial_adapter = capture_parameter_state(adapter)
+
+        class DummyClip(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.config = SimpleNamespace(
+                    projection_dim=2,
+                    text_config=SimpleNamespace(hidden_size=2),
+                    vision_config=SimpleNamespace(hidden_size=2),
+                )
+                self.text_projection = nn.Linear(2, 2, bias=False)
+                self.visual_projection = nn.Linear(2, 2, bias=False)
+
+        clip = DummyClip()
+        tokenizer = SimpleNamespace(vocab_size=10)
+        bank = SimpleNamespace(
+            selected_image_fingerprint="subset",
+            file_fingerprint="bank",
+        )
+        split = SimpleNamespace(
+            train_images=("train.jpg",),
+            val_images=("val.jpg",),
+            fingerprint="split",
+        )
+        config = {"research_config": {"training_distance": "raw_euclidean_l2"}}
+        provenance = {
+            "source_subset_fingerprint": "subset",
+            "prompt_bank_fingerprint": "bank",
+            "split_fingerprint": "split",
+            "config_fingerprint": "config",
+        }
+        metrics = {"overall": {"contrastive_loss": 1.0}}
+        ffn_evaluations = 0
+        adapter_evaluations = 0
+
+        def evaluate(stage, clip_arg, ffn_arg, adapter_arg, *unused):
+            nonlocal ffn_evaluations, adapter_evaluations
+            self.assertIs(clip_arg, clip)
+            self.assertIs(ffn_arg, ffn)
+            self.assertIs(adapter_arg, adapter)
+            if stage == "clip":
+                label = "stage0_clip"
+            elif stage == "ffn":
+                label = "stage0_ffn_init" if ffn_evaluations == 0 else "stage1_ffn"
+                ffn_evaluations += 1
+                if label == "stage0_ffn_init":
+                    self.assertTrue(self._parameters_match(ffn, initial_ffn))
+            else:
+                label = (
+                    "stage1_adapter_init"
+                    if adapter_evaluations == 0
+                    else "stage2_adapter"
+                )
+                adapter_evaluations += 1
+                if label == "stage1_adapter_init":
+                    self.assertTrue(
+                        self._parameters_match(adapter, initial_adapter)
+                    )
+                    self.assertFalse(self._parameters_match(ffn, initial_ffn))
+                    self.assertTrue(
+                        all(
+                            not parameter.requires_grad
+                            for parameter in ffn.parameters()
+                        )
+                    )
+            events.append(label)
+            return metrics
+
+        ffn_parameter_ids = {id(parameter) for parameter in ffn.parameters()}
+        adapter_parameter_ids = {id(parameter) for parameter in adapter.parameters()}
+
+        class FakeOptimizer:
+            def __init__(self, label):
+                self.label = label
+
+            def step(self):
+                events.append("{}_optimizer_step".format(self.label))
+
+        def make_optimizer(parameters, lr):
+            del lr
+            parameter_ids = {id(parameter) for parameter in parameters}
+            if parameter_ids == ffn_parameter_ids:
+                label = "ffn"
+            elif parameter_ids == adapter_parameter_ids:
+                label = "adapter"
+            else:
+                self.fail("Optimizer received an unexpected parameter set")
+            events.append("{}_optimizer_created".format(label))
+            return FakeOptimizer(label)
+
+        def train(stage, *call_args, **unused):
+            ffn_arg = call_args[3]
+            adapter_arg = call_args[4]
+            optimizer = call_args[5]
+            self.assertIs(ffn_arg, ffn)
+            self.assertIs(adapter_arg, adapter)
+            if stage == "ffn":
+                self.assertTrue(self._parameters_match(ffn, initial_ffn))
+                module = ffn
+            else:
+                self.assertTrue(self._parameters_match(adapter, initial_adapter))
+                module = adapter
+            events.append("{}_train".format(stage))
+            optimizer.step()
+            with torch.no_grad():
+                next(module.parameters()).add_(1.0)
+            state = {
+                name: value.detach().cpu().clone()
+                for name, value in module.state_dict().items()
+            }
+            return 0.5, 1, state
+
+        with TemporaryDirectory() as temporary_directory, patch(
+            "tools.train_rich_alignment.resolve_and_validate_data",
+            return_value=(
+                object(),
+                Path("clip"),
+                Path("images"),
+                bank,
+                split,
+                {},
+                {},
+            ),
+        ), patch(
+            "tools.train_rich_alignment.load_offline_clip",
+            return_value=(object(), tokenizer, clip, {}),
+        ), patch(
+            "tools.train_rich_alignment.VisualAlignmentFFN", return_value=ffn
+        ), patch(
+            "tools.train_rich_alignment.TokenTextAdapter", return_value=adapter
+        ), patch(
+            "tools.train_rich_alignment.build_configs",
+            return_value=(config, provenance),
+        ), patch(
+            "tools.train_rich_alignment.evaluate_stage", side_effect=evaluate
+        ), patch(
+            "tools.train_rich_alignment.train_stage", side_effect=train
+        ), patch(
+            "tools.train_rich_alignment.torch.optim.Adam",
+            side_effect=make_optimizer,
+        ), patch(
+            "tools.train_rich_alignment.atomic_json_write"
+        ) as json_write, patch(
+            "tools.train_rich_alignment.atomic_torch_save"
+        ):
+            return_code = alignment_main(
+                ["--device", "cpu", "--output-dir", temporary_directory]
+            )
+
+        self.assertEqual(return_code, 0)
+        self.assertEqual(
+            events,
+            [
+                "stage0_clip",
+                "stage0_ffn_init",
+                "ffn_optimizer_created",
+                "ffn_train",
+                "ffn_optimizer_step",
+                "stage1_ffn",
+                "stage1_adapter_init",
+                "adapter_optimizer_created",
+                "adapter_train",
+                "adapter_optimizer_step",
+                "stage2_adapter",
+            ],
+        )
+        written_names = [call.args[1].name for call in json_write.call_args_list]
+        for required_name in (
+            "stage0_clip_metrics.json",
+            "stage0_ffn_init_metrics.json",
+            "stage1_ffn_metrics.json",
+            "stage1_adapter_init_metrics.json",
+            "stage2_adapter_metrics.json",
+            "alignment_summary.json",
+        ):
+            self.assertIn(required_name, written_names)
+        summary_call = next(
+            call
+            for call in json_write.call_args_list
+            if call.args[1].name == "alignment_summary.json"
+        )
+        self.assertTrue(
+            {
+                "stage0_clip",
+                "stage0_ffn_init",
+                "stage1_ffn",
+                "stage1_adapter_init",
+                "stage2_adapter",
+            }.issubset(summary_call.args[0])
         )
 
 
