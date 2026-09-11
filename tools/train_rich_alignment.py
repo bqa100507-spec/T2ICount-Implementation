@@ -125,6 +125,20 @@ def parse_args(argv=None):
     parser.add_argument("--seed", type=int, default=3407)
     parser.add_argument("--ffn-epochs", type=int, default=10)
     parser.add_argument("--adapter-epochs", type=int, default=10)
+    parser.add_argument(
+        "--ffn-architecture",
+        choices=("minimal", "figure3_bn"),
+        default="minimal",
+        help=(
+            "Visual alignment FFN: the existing minimal control or the "
+            "Figure-3-inspired two-block FFN with BatchNorm."
+        ),
+    )
+    parser.add_argument(
+        "--stage-a-only",
+        action="store_true",
+        help="Train and evaluate the visual FFN, then exit before Stage B.",
+    )
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--lr-ffn", type=float, default=1e-4)
     parser.add_argument("--lr-adapter", type=float, default=1e-4)
@@ -208,6 +222,10 @@ def validate_args(args):
         raise RichAlignmentError(
             "--validate-only, --stage0-diagnostics-only, and "
             "--init-diagnostics-only are mutually exclusive"
+        )
+    if args.stage_a_only and diagnostic_modes:
+        raise RichAlignmentError(
+            "--stage-a-only cannot be combined with diagnostic-only modes"
         )
     if (
         not args.validate_only
@@ -659,11 +677,23 @@ def run_forward_smoke(
     records = [bank.records[name] for name in names]
     classes = [record.class_name for record in records]
     negatives = build_negative_indices(classes, args.seed, "validate_only_smoke")
-    with Image.open(image_root / names[0]) as image:
+    smoke_batch_size = (
+        2
+        if any(isinstance(module, torch.nn.BatchNorm1d) for module in ffn.modules())
+        else 1
+    )
+    smoke_images = []
+    try:
+        for name in names[:smoke_batch_size]:
+            with Image.open(image_root / name) as image:
+                smoke_images.append(image.convert("RGB"))
         pixel_values = processor(
-            images=image.convert("RGB"), return_tensors="pt"
+            images=smoke_images, return_tensors="pt"
         )["pixel_values"].to(args.device)
-    batch_indices = torch.tensor([0])
+    finally:
+        for image in smoke_images:
+            image.close()
+    batch_indices = torch.arange(smoke_batch_size)
     positive_texts, negative_texts = build_batch_prompts(
         batch_indices, records, negatives
     )
@@ -721,6 +751,22 @@ def run_forward_smoke(
     }
 
 
+def visual_ffn_description(architecture):
+    if architecture == "minimal":
+        return (
+            "Linear(D,D)-ReLU-Dropout-Linear(D,D); "
+            "D=clip_model.config.projection_dim"
+        )
+    if architecture == "figure3_bn":
+        return (
+            "Linear(D,D)-ReLU-Dropout-Linear(D,D)-ReLU-Dropout-"
+            "BatchNorm1d(D); D=clip_model.config.projection_dim"
+        )
+    raise RichAlignmentError(
+        "Unknown visual FFN architecture: {}".format(architecture)
+    )
+
+
 def build_configs(args, clip_path, bank, split):
     training_distance = (
         "l2_normalized_euclidean"
@@ -735,6 +781,7 @@ def build_configs(args, clip_path, bank, split):
         "alignment_validation_samples": len(split.val_images),
         "alignment_split_seed": args.split_seed,
         "seed": args.seed,
+        "ffn_architecture": args.ffn_architecture,
         "ffn_epochs": args.ffn_epochs,
         "adapter_epochs": args.adapter_epochs,
         "batch_size": args.batch_size,
@@ -755,6 +802,7 @@ def build_configs(args, clip_path, bank, split):
         "prompt_bank_fingerprint": bank.file_fingerprint,
         "split_fingerprint": split.fingerprint,
         "config_fingerprint": config_fingerprint,
+        "ffn_architecture": args.ffn_architecture,
         "normalize_embeddings": args.normalize_embeddings,
         "training_distance": training_distance,
     }
@@ -771,7 +819,7 @@ def build_configs(args, clip_path, bank, split):
         "implementation_choices": {
             "visual_input": "full stored FSC147 384 image",
             "visual_preprocessing": "standard local CLIPProcessor only",
-            "visual_ffn": "Linear(768,768)-ReLU-Dropout-Linear(768,768)",
+            "visual_ffn": visual_ffn_description(args.ffn_architecture),
             "text_adapter": (
                 "token-wise residual Linear(768,768)-ReLU-Dropout-"
                 "Linear(768,768)"
@@ -788,6 +836,7 @@ def build_configs(args, clip_path, bank, split):
             "device": args.device,
             "num_workers": args.num_workers,
             "checkpoint_interval": args.checkpoint_interval,
+            "stage_a_only": args.stage_a_only,
             "offline_environment": {
                 "HF_HUB_OFFLINE": os.environ.get("HF_HUB_OFFLINE"),
                 "TRANSFORMERS_OFFLINE": os.environ.get("TRANSFORMERS_OFFLINE"),
@@ -869,6 +918,7 @@ def train_stage(
 ):
     trainable = ffn if stage == "ffn" else adapter
     handler = checkpoint_handler(output_dir, stage)
+    learning_curve = []
     for epoch_index in range(start_epoch, epochs):
         training_metrics = train_epoch(
             stage,
@@ -915,6 +965,38 @@ def train_stage(
             handler,
             ffn=ffn if stage == "adapter" else None,
         )
+        if stage == "ffn":
+            overall = validation_metrics["overall"]
+            learning_curve.append(
+                {
+                    "epoch": epoch_index + 1,
+                    "training_overall_contrastive_loss": training_metrics["loss"][
+                        "overall"
+                    ],
+                    "validation_overall_contrastive_loss": overall[
+                        "contrastive_loss"
+                    ],
+                    "d_pos": overall["mean_positive_euclidean_distance"],
+                    "d_neg": overall["mean_negative_euclidean_distance"],
+                    "separation_gap": overall["separation_gap"],
+                    "pairwise_alignment_accuracy": overall[
+                        "pairwise_alignment_accuracy"
+                    ],
+                    "retrieval_r_at_1": overall["retrieval_r_at_1"],
+                    "retrieval_sample_r_at_1": overall[
+                        "retrieval_sample_r_at_1"
+                    ],
+                    "retrieval_class_aware_r_at_1": overall[
+                        "retrieval_class_aware_r_at_1"
+                    ],
+                    "margin_violation_rate": overall["margin_violation_rate"],
+                    "positive_loss": overall["positive_loss"],
+                    "negative_loss": overall["negative_loss"],
+                }
+            )
+            atomic_json_write(
+                learning_curve, Path(output_dir) / "ffn_learning_curve.json"
+            )
         print(
             json.dumps(
                 {
@@ -1059,6 +1141,13 @@ def capture_parameter_state(module):
     }
 
 
+def capture_module_state(module):
+    return {
+        name: value.detach().cpu().clone()
+        for name, value in module.state_dict().items()
+    }
+
+
 def assert_parameter_state_unchanged(module, before, label):
     after = dict(module.named_parameters())
     if set(after) != set(before):
@@ -1068,6 +1157,18 @@ def assert_parameter_state_unchanged(module, before, label):
         if not torch.equal(expected, actual):
             raise RuntimeError(
                 "{} parameter changed during evaluation: {}".format(label, name)
+            )
+
+
+def assert_module_state_unchanged(module, before, label):
+    after = module.state_dict()
+    if set(after) != set(before):
+        raise RuntimeError("{} state names changed during evaluation".format(label))
+    for name, expected in before.items():
+        actual = after[name].detach().cpu()
+        if not torch.equal(expected, actual):
+            raise RuntimeError(
+                "{} state changed during evaluation: {}".format(label, name)
             )
 
 
@@ -1092,7 +1193,7 @@ def evaluate_initialization_stage(
                 metric_stage, evaluation_stage
             )
         )
-    before = capture_parameter_state(module)
+    before = capture_module_state(module)
     metrics = evaluate_stage(
         evaluation_stage,
         clip_model,
@@ -1105,7 +1206,7 @@ def evaluate_initialization_stage(
         processor,
         args,
     )
-    assert_parameter_state_unchanged(module, before, metric_stage)
+    assert_module_state_unchanged(module, before, metric_stage)
     return metrics
 
 
@@ -1186,7 +1287,9 @@ def main(argv=None):
             clip_path, device
         )
         ffn = VisualAlignmentFFN(
-            clip_model.config.projection_dim, args.dropout
+            clip_model.config.projection_dim,
+            args.dropout,
+            args.ffn_architecture,
         ).to(device)
         adapter = TokenTextAdapter(
             clip_model.config.text_config.hidden_size, args.dropout
@@ -1238,6 +1341,7 @@ def main(argv=None):
                 config_document["research_config"]["training_distance"]
             )
         )
+        print("ffn_architecture={}".format(args.ffn_architecture))
 
         if args.validate_only:
             smoke = run_forward_smoke(
@@ -1403,6 +1507,29 @@ def main(argv=None):
         atomic_json_write(
             {"stage1_ffn": stage1}, output_dir / "stage1_ffn_metrics.json"
         )
+        if args.stage_a_only:
+            summary = {
+                "stage0_clip": stage0,
+                "stage0_ffn_init": stage0_ffn_init,
+                "stage1_ffn": stage1,
+                "best_checkpoints": {
+                    "ffn": {
+                        "epoch": ffn_best_epoch,
+                        "validation_overall_contrastive_loss": ffn_best_metric,
+                    }
+                },
+                "provenance": provenance,
+                "parameter_counts": parameter_counts,
+                "ffn_architecture": args.ffn_architecture,
+                "stage_a_only": True,
+                "normalize_embeddings": args.normalize_embeddings,
+                "training_distance": config_document["research_config"][
+                    "training_distance"
+                ],
+            }
+            atomic_json_write(summary, output_dir / "alignment_summary.json")
+            print("Stage-A-only alignment training completed: {}".format(output_dir))
+            return 0
         configure_stage_b(clip_model, ffn, adapter)
         stage1_adapter_init = evaluate_initialization_stage(
             "stage1_adapter_init",
@@ -1507,6 +1634,8 @@ def main(argv=None):
             },
             "provenance": provenance,
             "parameter_counts": parameter_counts,
+            "ffn_architecture": args.ffn_architecture,
+            "stage_a_only": False,
             "normalize_embeddings": args.normalize_embeddings,
             "training_distance": config_document["research_config"][
                 "training_distance"

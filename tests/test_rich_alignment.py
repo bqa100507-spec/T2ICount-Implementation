@@ -26,12 +26,15 @@ from utils.rich_alignment import (
     validate_resume_provenance,
 )
 from tools.train_rich_alignment import (
+    build_configs,
     build_stage0_diagnostics_document,
     capture_parameter_state,
+    evaluate_initialization_stage,
     main as alignment_main,
     parse_args,
     run_init_diagnostics_only,
     run_stage0_diagnostics_only,
+    train_stage,
     validate_args,
 )
 
@@ -64,6 +67,21 @@ class NormalizationFlagTests(unittest.TestCase):
                     ["--stage0-diagnostics-only", "--init-diagnostics-only"]
                 )
             )
+
+    def test_ffn_architecture_defaults_to_minimal_and_figure3_is_opt_in(self):
+        self.assertEqual(parse_args([]).ffn_architecture, "minimal")
+        self.assertEqual(
+            parse_args(["--ffn-architecture", "figure3_bn"]).ffn_architecture,
+            "figure3_bn",
+        )
+
+    def test_stage_a_only_defaults_off_and_is_opt_in(self):
+        self.assertFalse(parse_args([]).stage_a_only)
+        self.assertTrue(parse_args(["--stage-a-only"]).stage_a_only)
+
+    def test_stage_a_only_cannot_enter_a_diagnostic_only_path(self):
+        with self.assertRaisesRegex(RichAlignmentError, "cannot be combined"):
+            validate_args(parse_args(["--stage-a-only", "--validate-only"]))
 
 
 class ContrastiveLossTests(unittest.TestCase):
@@ -209,8 +227,71 @@ class ModuleAndFreezeTests(unittest.TestCase):
         self.assertEqual(adapter(inputs).shape, inputs.shape)
 
     def test_visual_ffn_outputs_768(self):
-        ffn = VisualAlignmentFFN(dropout=0.0)
+        ffn = VisualAlignmentFFN(embedding_dim=768, dropout=0.0)
         self.assertEqual(ffn(torch.randn(3, 768)).shape, (3, 768))
+
+    def test_minimal_visual_ffn_module_order_is_unchanged(self):
+        ffn = VisualAlignmentFFN(embedding_dim=4, dropout=0.25)
+        self.assertEqual(
+            [type(module) for module in ffn.network],
+            [nn.Linear, nn.ReLU, nn.Dropout, nn.Linear],
+        )
+        self.assertEqual(ffn.network[0].in_features, 4)
+        self.assertEqual(ffn.network[0].out_features, 4)
+        self.assertEqual(ffn.network[3].in_features, 4)
+        self.assertEqual(ffn.network[3].out_features, 4)
+        self.assertEqual(ffn.network[2].p, 0.25)
+
+    def test_figure3_bn_visual_ffn_exact_order_and_output_shape(self):
+        ffn = VisualAlignmentFFN(
+            embedding_dim=5, dropout=0.25, architecture="figure3_bn"
+        )
+        self.assertEqual(
+            [type(module) for module in ffn.network],
+            [
+                nn.Linear,
+                nn.ReLU,
+                nn.Dropout,
+                nn.Linear,
+                nn.ReLU,
+                nn.Dropout,
+                nn.BatchNorm1d,
+            ],
+        )
+        self.assertEqual(ffn.network[6].num_features, 5)
+        self.assertEqual(ffn(torch.randn(3, 5)).shape, (3, 5))
+
+    def test_figure3_batchnorm_train_and_eval_behavior(self):
+        torch.manual_seed(23)
+        ffn = VisualAlignmentFFN(
+            embedding_dim=3, dropout=0.0, architecture="figure3_bn"
+        )
+        batch_norm = ffn.network[-1]
+        before_training_variance = batch_norm.running_var.clone()
+        ffn.train()
+        ffn(torch.randn(8, 3) + 4.0)
+        self.assertEqual(batch_norm.num_batches_tracked.item(), 1)
+        self.assertFalse(
+            torch.equal(before_training_variance, batch_norm.running_var)
+        )
+
+        ffn.eval()
+        before_evaluation = batch_norm.running_mean.clone()
+        inputs = torch.randn(4, 3)
+        first = ffn(inputs)
+        second = ffn(inputs)
+        self.assertTrue(torch.equal(before_evaluation, batch_norm.running_mean))
+        self.assertTrue(torch.equal(first, second))
+
+    def test_minimal_visual_ffn_remains_seed_deterministic(self):
+        inputs = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+        torch.manual_seed(3407)
+        first = VisualAlignmentFFN(embedding_dim=4, dropout=0.0)
+        torch.manual_seed(3407)
+        second = VisualAlignmentFFN(
+            embedding_dim=4, dropout=0.0, architecture="minimal"
+        )
+        self.assertTrue(torch.equal(first(inputs), second(inputs)))
 
     def test_stage_a_updates_only_ffn(self):
         torch.manual_seed(3)
@@ -525,6 +606,82 @@ class MetricTests(unittest.TestCase):
         self.assertEqual(first, second)
 
 
+class LearningCurveTests(unittest.TestCase):
+    def test_ffn_learning_curve_writes_requested_epoch_fields(self):
+        ffn = VisualAlignmentFFN(embedding_dim=2, dropout=0.0)
+        training = {"sample_count": 2, "loss": {"overall": 0.75}}
+        overall = {
+            "contrastive_loss": 0.5,
+            "mean_positive_euclidean_distance": 0.4,
+            "mean_negative_euclidean_distance": 1.1,
+            "separation_gap": 0.7,
+            "pairwise_alignment_accuracy": 0.8,
+            "retrieval_r_at_1": 0.6,
+            "retrieval_sample_r_at_1": 0.5,
+            "retrieval_class_aware_r_at_1": 0.7,
+            "margin_violation_rate": 0.2,
+            "positive_loss": 0.3,
+            "negative_loss": 0.1,
+        }
+        validation = {"overall": overall}
+
+        with TemporaryDirectory() as temporary_directory, patch(
+            "tools.train_rich_alignment.checkpoint_handler", return_value=object()
+        ), patch(
+            "tools.train_rich_alignment.train_epoch", return_value=training
+        ), patch(
+            "tools.train_rich_alignment.evaluate_stage", return_value=validation
+        ), patch(
+            "tools.train_rich_alignment.save_epoch_checkpoint"
+        ), patch(
+            "tools.train_rich_alignment.atomic_json_write"
+        ) as json_write:
+            train_stage(
+                "ffn",
+                0,
+                1,
+                object(),
+                ffn,
+                object(),
+                object(),
+                object(),
+                ["train.jpg"],
+                ["val.jpg"],
+                object(),
+                object(),
+                object(),
+                object(),
+                Path(temporary_directory),
+                {},
+                {},
+            )
+
+        json_write.assert_called_once()
+        self.assertEqual(json_write.call_args.args[1].name, "ffn_learning_curve.json")
+        record = json_write.call_args.args[0][0]
+        self.assertEqual(
+            set(record),
+            {
+                "epoch",
+                "training_overall_contrastive_loss",
+                "validation_overall_contrastive_loss",
+                "d_pos",
+                "d_neg",
+                "separation_gap",
+                "pairwise_alignment_accuracy",
+                "retrieval_r_at_1",
+                "retrieval_sample_r_at_1",
+                "retrieval_class_aware_r_at_1",
+                "margin_violation_rate",
+                "positive_loss",
+                "negative_loss",
+            },
+        )
+        self.assertEqual(record["epoch"], 1)
+        self.assertEqual(record["training_overall_contrastive_loss"], 0.75)
+        self.assertEqual(record["validation_overall_contrastive_loss"], 0.5)
+
+
 class Stage0DiagnosticsOnlyTests(unittest.TestCase):
     @staticmethod
     def _stage_metrics():
@@ -646,6 +803,45 @@ class InitializationDiagnosticsTests(unittest.TestCase):
         self.assertEqual(set(result), {"stage0_clip", "stage0_ffn_init"})
         train.assert_not_called()
         optimizer.assert_not_called()
+
+    def test_init_diagnostic_does_not_mutate_batchnorm_running_statistics(self):
+        ffn = VisualAlignmentFFN(
+            embedding_dim=3, dropout=0.0, architecture="figure3_bn"
+        )
+        adapter = TokenTextAdapter(embedding_dim=3, dropout=0.0)
+        batch_norm = ffn.network[-1]
+        before_mean = batch_norm.running_mean.clone()
+        before_variance = batch_norm.running_var.clone()
+        before_batches = batch_norm.num_batches_tracked.clone()
+
+        def evaluate(stage, clip_arg, ffn_arg, adapter_arg, *unused):
+            del clip_arg, adapter_arg
+            self.assertEqual(stage, "ffn")
+            ffn_arg.eval()
+            ffn_arg(torch.randn(4, 3))
+            return {"overall": {"contrastive_loss": 1.0}}
+
+        with patch(
+            "tools.train_rich_alignment.evaluate_stage", side_effect=evaluate
+        ):
+            evaluate_initialization_stage(
+                "stage0_ffn_init",
+                "ffn",
+                ffn,
+                object(),
+                ffn,
+                adapter,
+                object(),
+                ["v1.jpg"],
+                object(),
+                object(),
+                object(),
+                object(),
+            )
+
+        self.assertTrue(torch.equal(before_mean, batch_norm.running_mean))
+        self.assertTrue(torch.equal(before_variance, batch_norm.running_var))
+        self.assertTrue(torch.equal(before_batches, batch_norm.num_batches_tracked))
 
     def test_normal_path_evaluates_init_parameters_before_same_modules_train(self):
         events = []
@@ -843,8 +1039,173 @@ class InitializationDiagnosticsTests(unittest.TestCase):
             }.issubset(summary_call.args[0])
         )
 
+    def test_stage_a_only_writes_ffn_results_and_never_enters_stage_b(self):
+        ffn = VisualAlignmentFFN(embedding_dim=2, dropout=0.0)
+        adapter = TokenTextAdapter(embedding_dim=2, dropout=0.0)
+
+        class DummyClip(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.config = SimpleNamespace(
+                    projection_dim=2,
+                    text_config=SimpleNamespace(hidden_size=2),
+                    vision_config=SimpleNamespace(hidden_size=2),
+                )
+                self.text_projection = nn.Linear(2, 2, bias=False)
+                self.visual_projection = nn.Linear(2, 2, bias=False)
+
+        clip = DummyClip()
+        tokenizer = SimpleNamespace(vocab_size=10)
+        bank = SimpleNamespace(
+            selected_image_fingerprint="subset",
+            file_fingerprint="bank",
+        )
+        split = SimpleNamespace(
+            train_images=("train.jpg",),
+            val_images=("val.jpg",),
+            fingerprint="split",
+        )
+        config = {"research_config": {"training_distance": "raw_euclidean_l2"}}
+        provenance = {
+            "source_subset_fingerprint": "subset",
+            "prompt_bank_fingerprint": "bank",
+            "split_fingerprint": "split",
+            "config_fingerprint": "config",
+            "ffn_architecture": "minimal",
+        }
+        metrics = {"overall": {"contrastive_loss": 0.5}}
+        best_state = {
+            name: value.detach().cpu().clone()
+            for name, value in ffn.state_dict().items()
+        }
+
+        with TemporaryDirectory() as temporary_directory, patch(
+            "tools.train_rich_alignment.resolve_and_validate_data",
+            return_value=(
+                object(),
+                Path("clip"),
+                Path("images"),
+                bank,
+                split,
+                {},
+                {},
+            ),
+        ), patch(
+            "tools.train_rich_alignment.load_offline_clip",
+            return_value=(object(), tokenizer, clip, {}),
+        ), patch(
+            "tools.train_rich_alignment.VisualAlignmentFFN", return_value=ffn
+        ), patch(
+            "tools.train_rich_alignment.TokenTextAdapter", return_value=adapter
+        ), patch(
+            "tools.train_rich_alignment.build_configs",
+            return_value=(config, provenance),
+        ), patch(
+            "tools.train_rich_alignment.evaluate_stage", return_value=metrics
+        ) as evaluate, patch(
+            "tools.train_rich_alignment.evaluate_initialization_stage",
+            return_value=metrics,
+        ) as evaluate_initialization, patch(
+            "tools.train_rich_alignment.train_stage",
+            return_value=(0.5, 1, best_state),
+        ) as train, patch(
+            "tools.train_rich_alignment.configure_stage_b"
+        ) as configure_stage_b_mock, patch(
+            "tools.train_rich_alignment.torch.optim.Adam"
+        ) as optimizer, patch(
+            "tools.train_rich_alignment.atomic_json_write"
+        ) as json_write, patch(
+            "tools.train_rich_alignment.atomic_torch_save"
+        ) as torch_save:
+            return_code = alignment_main(
+                [
+                    "--device",
+                    "cpu",
+                    "--output-dir",
+                    temporary_directory,
+                    "--stage-a-only",
+                ]
+            )
+
+        self.assertEqual(return_code, 0)
+        self.assertEqual(train.call_count, 1)
+        self.assertEqual(train.call_args.args[0], "ffn")
+        self.assertEqual(optimizer.call_count, 1)
+        configure_stage_b_mock.assert_not_called()
+        self.assertEqual(evaluate_initialization.call_count, 1)
+        self.assertEqual(evaluate_initialization.call_args.args[0], "stage0_ffn_init")
+        self.assertEqual(
+            [call.args[0] for call in evaluate.call_args_list], ["clip", "ffn"]
+        )
+        written_names = [call.args[1].name for call in json_write.call_args_list]
+        for required_name in (
+            "stage0_clip_metrics.json",
+            "stage0_ffn_init_metrics.json",
+            "stage1_ffn_metrics.json",
+            "alignment_summary.json",
+        ):
+            self.assertIn(required_name, written_names)
+        for forbidden_name in (
+            "stage1_adapter_init_metrics.json",
+            "stage2_adapter_metrics.json",
+        ):
+            self.assertNotIn(forbidden_name, written_names)
+        self.assertEqual(torch_save.call_count, 1)
+        self.assertEqual(torch_save.call_args.args[1].name, "ffn_best.pt")
+        summary = next(
+            call.args[0]
+            for call in json_write.call_args_list
+            if call.args[1].name == "alignment_summary.json"
+        )
+        self.assertEqual(
+            set(summary).intersection(
+                {
+                    "stage0_clip",
+                    "stage0_ffn_init",
+                    "stage1_ffn",
+                    "stage1_adapter_init",
+                    "stage2_adapter",
+                }
+            ),
+            {"stage0_clip", "stage0_ffn_init", "stage1_ffn"},
+        )
+        self.assertEqual(summary["best_checkpoints"]["ffn"]["epoch"], 1)
+
 
 class ResumeProvenanceTests(unittest.TestCase):
+    @staticmethod
+    def _config_args(architecture):
+        return parse_args(["--ffn-architecture", architecture])
+
+    def test_ffn_architecture_is_in_config_fingerprint_and_provenance(self):
+        bank = SimpleNamespace(
+            selected_image_fingerprint="subset",
+            file_fingerprint="bank",
+            path="prompt-bank.json",
+        )
+        split = SimpleNamespace(
+            train_images=("train.jpg",),
+            val_images=("val.jpg",),
+            fingerprint="split",
+        )
+        minimal, minimal_provenance = build_configs(
+            self._config_args("minimal"), Path("clip"), bank, split
+        )
+        figure3, figure3_provenance = build_configs(
+            self._config_args("figure3_bn"), Path("clip"), bank, split
+        )
+
+        self.assertEqual(minimal["research_config"]["ffn_architecture"], "minimal")
+        self.assertEqual(minimal_provenance["ffn_architecture"], "minimal")
+        self.assertEqual(figure3_provenance["ffn_architecture"], "figure3_bn")
+        self.assertNotEqual(
+            minimal["config_fingerprint"], figure3["config_fingerprint"]
+        )
+        self.assertIn("BatchNorm1d(D)", figure3["implementation_choices"]["visual_ffn"])
+        self.assertFalse(
+            figure3["implementation_choices"]["richcount_reproduction"]
+        )
+
     def test_resume_rejects_provenance_mismatch(self):
         current = {
             "source_subset_fingerprint": "subset",
@@ -874,6 +1235,22 @@ class ResumeProvenanceTests(unittest.TestCase):
             )
         }
         with self.assertRaisesRegex(RichAlignmentError, "normalize_embeddings"):
+            validate_resume_provenance(current, checkpoint)
+
+    def test_resume_rejects_ffn_architecture_mismatch(self):
+        current = {
+            "source_subset_fingerprint": "subset",
+            "prompt_bank_fingerprint": "bank",
+            "split_fingerprint": "split",
+            "config_fingerprint": "same-for-focused-test",
+            "ffn_architecture": "figure3_bn",
+            "normalize_embeddings": True,
+            "training_distance": "l2_normalized_euclidean",
+        }
+        checkpoint = {
+            "provenance": dict(current, ffn_architecture="minimal")
+        }
+        with self.assertRaisesRegex(RichAlignmentError, "ffn_architecture"):
             validate_resume_provenance(current, checkpoint)
 
 

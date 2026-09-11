@@ -60,16 +60,33 @@ class AlignmentSplit:
 
 
 class VisualAlignmentFFN(nn.Module):
-    """Minimal full-width visual FFN operating in CLIP joint space."""
+    """Selectable full-width visual FFN operating in CLIP joint space."""
 
-    def __init__(self, embedding_dim=768, dropout=0.1):
+    def __init__(self, embedding_dim, dropout=0.1, architecture="minimal"):
         super().__init__()
-        self.network = nn.Sequential(
-            nn.Linear(embedding_dim, embedding_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(embedding_dim, embedding_dim),
-        )
+        if architecture == "minimal":
+            layers = (
+                nn.Linear(embedding_dim, embedding_dim),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(embedding_dim, embedding_dim),
+            )
+        elif architecture == "figure3_bn":
+            layers = (
+                nn.Linear(embedding_dim, embedding_dim),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(embedding_dim, embedding_dim),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.BatchNorm1d(embedding_dim),
+            )
+        else:
+            raise RichAlignmentError(
+                "Unknown visual FFN architecture: {}".format(architecture)
+            )
+        self.architecture = architecture
+        self.network = nn.Sequential(*layers)
 
     def forward(self, inputs):
         return self.network(inputs)
@@ -611,6 +628,7 @@ def validate_resume_provenance(current: Mapping[str, object], checkpoint) -> Non
         "source_subset_fingerprint",
         "prompt_bank_fingerprint",
         "split_fingerprint",
+        "ffn_architecture",
         "config_fingerprint",
         "normalize_embeddings",
         "training_distance",
