@@ -11,13 +11,34 @@ narrative report. Approximate values remain marked with `≈`.
 
 ## Goal and active direction
 
-The project studies zero-shot object counting, based primarily on T2ICount. The
-long-term goal is to improve T2ICount's text sensitivity and rich-prompt
-capability through controlled experiments.
+Researcher-reviewed objective update (2026-10-26): the primary goal is to improve
+T2ICount's zero-shot counting accuracy when inference uses a short class name.
+Detailed and generalized rich prompts are primarily auxiliary semantic
+information during training. Whether that auxiliary information improves
+class-name counting remains to be established through controlled experiments.
 
-The active direction is RichPrompt / RichCount-inspired visual-text alignment.
-DUMLO is parked, not deleted. This project is not currently a faithful
+Rich-prompt inference, CLIP alignment, and internal feature-map analysis are
+secondary diagnostics, not the primary deployment objective. The recorded
+RichPrompt / RichCount-inspired alignment work remains part of the research
+history; its value to this objective requires downstream class-name counting
+evidence. DUMLO is parked, not deleted. This project is not currently a faithful
 reproduction of RichCount; it adapts selected ideas and components.
+
+This update changes the research priority, preserves the historical results and
+original conclusions below, and does not approve a new experiment.
+
+### Primary evaluation and diagnostic metrics
+
+- Primary evaluation: counting MAE and RMSE with short class-name inference on
+  the appropriate fixed datasets and evaluation protocols. Comparisons must
+  retain the specified subsets, splits, seeds, preprocessing, evaluator, and
+  checkpoint-selection rule unless explicitly approved as a changed variable.
+- Diagnostics: detailed/generalized inference MAE/RMSE and per-prompt behavior;
+  CLIP/alignment loss, positive/negative distances, separation gap, margin
+  violation rate, pairwise accuracy, and retrieval metrics; and internal
+  feature-map, attention, or spatial-grounding analysis. These can help explain
+  behavior but cannot establish improvement in the primary objective without
+  class-name counting evidence.
 
 ## Architectural boundary
 
@@ -213,6 +234,23 @@ Accepted synthesis (RP-007):
 This branch decision motivated investigating representation alignment before
 any further consistency tuning.
 
+Reviewed attribution limit (2026-10-26): RP-003 (`lambda_cons=0`) improved
+standard FSC-147 test MAE from BASE-002's 22.82 to 19.98 under class-name
+inference (test RMSE 120.25 to 107.13). This observation does NOT establish that
+rich semantics caused the improvement or that auxiliary rich prompts are
+already proven beneficial.
+
+For compatible positive samples, the supervised loss changes from `L_class` to
+`(L_class + L_detailed + L_generalized) / 3`. The class branch's direct gradient
+contribution is therefore weighted by one third rather than one, while the
+other two branches also contribute gradients to shared parameters. The
+comparison confounds rich semantic supervision with changed class-branch loss
+weighting and gradient contributions. A matched class-only control is needed
+to isolate rich semantic content from those changes before attributing gains
+to rich-prompt supervision. This is an unresolved control requirement, not an
+approved experiment; the original observations and conclusions above remain
+preserved as historical records.
+
 ### 7. RichCount-inspired Stage-1 investigation
 
 The earlier working hypothesis was that detailed/generalized prompts were not
@@ -380,6 +418,10 @@ Not yet done:
 - DUMLO remains parked.
 
 No proposed future experiment is a completed result.
+
+ALIGN-004 remains the latest completed alignment experiment. ALIGN-005 remains
+proposed but not executed and is not scientifically approved. The reviewed
+objective update does not authorize ALIGN-005 or any other new experiment.
 
 ## Do not repeat without a new hypothesis
 

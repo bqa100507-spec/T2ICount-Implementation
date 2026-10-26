@@ -76,3 +76,10 @@
     Stage-A = visual FFN training;
     Stage-B = text Adapter training.
     Do not confuse them with RichCount paper Stage 1 / Stage 2.
+
+17. The primary objective is improved T2ICount zero-shot counting with short
+    class-name inference. Evaluate research changes primarily through class-name
+    counting MAE/RMSE on the appropriate fixed datasets and protocols. Detailed
+    and generalized rich prompts are primarily auxiliary training information;
+    treat rich-prompt inference and alignment metrics as diagnostics unless a
+    new research objective is explicitly approved.
