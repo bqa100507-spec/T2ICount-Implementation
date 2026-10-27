@@ -121,6 +121,14 @@ def validate_train_sample_options(args):
     rich_prompt_bank = getattr(args, 'rich_prompt_bank', None)
     consistency_weight = getattr(args, 'rich_consistency_weight', 0.0)
     diagnostic_steps = getattr(args, 'rich_loss_diagnostic_steps', 0)
+    supervision_mode = getattr(args, 'rich_supervision_mode', 'rich')
+    if supervision_mode not in ('rich', 'repeat-class'):
+        raise ValueError('Invalid --rich-supervision-mode.')
+    if supervision_mode == 'repeat-class':
+        if not rich_prompt_bank:
+            raise ValueError('--rich-supervision-mode repeat-class requires --rich-prompt-bank.')
+        if consistency_weight != 0.0:
+            raise ValueError('repeat-class requires --rich-consistency-weight 0.')
     if not math.isfinite(consistency_weight) or consistency_weight < 0:
         raise ValueError('--rich-consistency-weight must be finite and non-negative.')
     if diagnostic_steps < 0:
@@ -368,14 +376,16 @@ class Reg_Trainer(Trainer):
                 consistency_weight=args.rich_consistency_weight,
                 train_samples=args.train_samples,
                 train_subset_seed=args.train_subset_seed,
+                supervision_mode=getattr(args, 'rich_supervision_mode', 'rich'),
             )
             logging.info(
                 'Rich prompt training enabled: bank=%s samples=%d '
-                'fingerprint=%s consistency_weight=%.6g',
+                'fingerprint=%s consistency_weight=%.6g supervision_mode=%s',
                 self.rich_prompt_config['prompt_bank_filename'],
                 len(selected_image_names),
                 self.rich_prompt_config['prompt_bank_fingerprint'],
                 args.rich_consistency_weight,
+                self.rich_prompt_config['rich_supervision_mode'],
             )
         apply_smoke_train_sample_limit(
             self.datasets, args.smoke_train_samples
@@ -570,6 +580,13 @@ class Reg_Trainer(Trainer):
                         ].index_select(0, rich_indices_cpu).to(
                             self.device
                         ).unsqueeze(2).unsqueeze(3)
+                        if getattr(args, 'rich_supervision_mode', 'rich') == 'repeat-class':
+                            detailed_captions = generalized_captions = tuple(
+                                caption[index] for index in selected
+                            )
+                            detailed_masks = generalized_masks = (
+                                gt_prompt_attn_mask.index_select(0, rich_indices)
+                            )
                         rich_inputs = inputs.index_select(0, rich_indices)
 
                         detailed_outputs = self.model(
@@ -591,11 +608,16 @@ class Reg_Trainer(Trainer):
                         )
                         detailed_loss = detailed_components['total']
                         generalized_loss = generalized_components['total']
-                        consistency_terms = rich_consistency_loss(
-                            class_rich_outputs[0],
-                            detailed_outputs[0],
-                            generalized_outputs[0],
-                        )
+                        if getattr(args, 'rich_supervision_mode', 'rich') == 'repeat-class':
+                            if args.rich_consistency_weight != 0.0:
+                                raise ValueError('repeat-class requires --rich-consistency-weight 0.')
+                            consistency_terms = {'mean': detailed_loss.new_zeros(())}
+                        else:
+                            consistency_terms = rich_consistency_loss(
+                                class_rich_outputs[0],
+                                detailed_outputs[0],
+                                generalized_outputs[0],
+                            )
                         loss, rich_supervised = (
                             combine_rich_sample_weighted_loss(
                                 class_components['total'],
@@ -655,9 +677,7 @@ class Reg_Trainer(Trainer):
                 epoch_mae.update(np.mean(np.abs(diff)).item(), N)
                 epoch_mse.update(np.mean(diff * diff), N)
 
-                self.optimizer.zero_grad()
-                loss.backward()
-                self.optimizer.step()
+                self._optimize_batch(loss)
 
                 completed_steps = step + 1
                 if (
@@ -691,6 +711,12 @@ class Reg_Trainer(Trainer):
                 train_samples_seen,
                 rich_fraction,
             )
+
+    def _optimize_batch(self, loss):
+        """One unchanged optimizer update; preflight overrides this to omit step."""
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
 
     def val_epoch(self):
         epoch_start = time.time()

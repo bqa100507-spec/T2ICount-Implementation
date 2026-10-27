@@ -13,7 +13,7 @@ from utils.paths import (
 )
 
 
-def parse_arg():
+def parse_arg(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument('--asset-root', default=None,
                         help='External asset root; overrides T2ICOUNT_ASSET_ROOT.')
@@ -54,6 +54,9 @@ def parse_arg():
                         help='seed for deterministic training subset selection')
     parser.add_argument('--rich-prompt-bank', default=None,
                         help='validated Phase 2A prompt bank for opt-in rich training')
+    parser.add_argument('--rich-supervision-mode', default='rich',
+                        choices=('rich', 'repeat-class'),
+                        help='auxiliary supervision: rich prompts or RP-008 repeated class prompts')
     parser.add_argument('--rich-consistency-weight', default=0.0, type=float,
                         help='weight for symmetric rich-prompt density consistency')
     parser.add_argument('--rich-loss-diagnostic-steps', default=0, type=int,
@@ -80,7 +83,7 @@ def parse_arg():
     parser.add_argument('--val-epoch', default=1, type=int,
                         help='the number of epoch between validation')
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     validate_train_sample_options(args)
     validate_checkpoint_interval(args.checkpoint_interval)
     return args

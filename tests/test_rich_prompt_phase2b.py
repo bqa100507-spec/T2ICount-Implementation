@@ -30,6 +30,7 @@ from utils.rich_prompt_training import (
     validate_prompt_bank_metadata,
     validate_resume_rich_config,
 )
+from tools.preflight_repeat_class import TensorSnapshot, compare_batch, rng_digest
 
 
 PILOT_FINGERPRINT = (
@@ -347,7 +348,8 @@ class _DummyModel(torch.nn.Module):
         self.train()
 
     def forward(self, inputs, captions, prompt_mask):
-        self.calls.append((inputs.detach().clone(), tuple(captions)))
+        self.calls.append((inputs.detach().clone(), tuple(captions),
+                           prompt_mask.detach().clone()))
         density = inputs[:, :1] * self.scale
         similarity = density
         fused = torch.zeros_like(density).detach()
@@ -368,7 +370,7 @@ def _training_batch(compatible=None):
         inputs,
         torch.zeros(2, 1, 2, 2),
         ('class-a', 'class-b'),
-        torch.ones(2, 77),
+        torch.arange(154).reshape(2, 77).float(),
         torch.ones(2, 1, 2, 2),
     )
     if compatible is None:
@@ -384,11 +386,12 @@ def _training_batch(compatible=None):
     return baseline + (rich_batch,)
 
 
-def _run_training_batch(compatible=None, diagnostic_steps=0):
+def _run_training_batch(compatible=None, diagnostic_steps=0, mode='rich'):
     trainer = Reg_Trainer.__new__(Reg_Trainer)
     trainer.args = SimpleNamespace(
         rich_consistency_weight=0.0,
         rich_loss_diagnostic_steps=diagnostic_steps,
+        rich_supervision_mode=mode,
     )
     trainer.device = torch.device('cpu')
     trainer.model = _DummyModel()
@@ -411,6 +414,79 @@ def _run_training_batch(compatible=None, diagnostic_steps=0):
 
 
 class ForwardAndLossTests(unittest.TestCase):
+    def test_repeat_class_reuses_exact_class_caption_mask_and_weighting(self):
+        with mock.patch('utils.regression_trainer.rich_consistency_loss') as consistency:
+            trainer = _run_training_batch([True, False], mode='repeat-class')
+        calls = trainer.model.calls
+        self.assertEqual(len(calls), 3)
+        for auxiliary in calls[1:]:
+            self.assertEqual(auxiliary[1], ('class-a',))
+            self.assertTrue(torch.equal(auxiliary[0], calls[0][0][:1]))
+            self.assertTrue(torch.equal(auxiliary[2], calls[0][2][:1]))
+        consistency.assert_not_called()
+        # Batch mean = (1 + 2)/2; repeating the first sample must not triple it.
+        self.assertAlmostEqual(trainer.model.scale.item(), 1 - 0.01 * 1.5, places=6)
+
+    def test_repeat_class_all_compatible_uses_all_class_prompts(self):
+        trainer = _run_training_batch([True, True], mode='repeat-class')
+        for call in trainer.model.calls[1:]:
+            self.assertEqual(call[1], trainer.model.calls[0][1])
+            self.assertTrue(torch.equal(call[2], trainer.model.calls[0][2]))
+
+    def test_repeat_class_incompatible_has_no_extra_forward(self):
+        trainer = _run_training_batch([False, False], mode='repeat-class')
+        self.assertEqual(len(trainer.model.calls), 1)
+
+    def test_repeat_class_passes_same_density_and_image_mask_to_auxiliary_losses(self):
+        seen = []
+        def record(outputs, density, image_mask):
+            seen.append((density.clone(), image_mask.clone()))
+            return _fake_t2i_components(outputs, density, image_mask)
+        trainer = Reg_Trainer.__new__(Reg_Trainer)
+        trainer.args = SimpleNamespace(rich_consistency_weight=0.,
+            rich_loss_diagnostic_steps=0, rich_supervision_mode='repeat-class')
+        trainer.device = torch.device('cpu')
+        trainer.model = _DummyModel()
+        trainer.optimizer = torch.optim.SGD(trainer.model.parameters(), lr=.01)
+        trainer.dataloaders = {'train': [_training_batch([True, False])]}
+        trainer.epoch = 0
+        trainer.rich_prompt_config = None
+        trainer._rich_diagnostic_steps_logged = 0
+        with mock.patch('utils.regression_trainer._t2i_loss_components', side_effect=record):
+            trainer.train_epoch()
+        self.assertEqual(len(seen), 4)
+        for density, image_mask in seen[1:]:
+            self.assertTrue(torch.equal(density, seen[0][0][:1]))
+            self.assertTrue(torch.equal(image_mask, seen[0][1][:1]))
+
+    def test_repeat_class_dataset_negatives_and_mosaics_are_still_class_only(self):
+        for branch in ('negative', 'mosaic'):
+            with self.subTest(branch=branch), tempfile.TemporaryDirectory() as directory:
+                dataset = _build_dataset(Path(directory))
+                random_values = [0.1, 0.9] if branch == 'negative' else [0.1, 0.1]
+                paths = [dataset.im_list[2]] if branch == 'negative' else dataset.im_list[1:4]
+                with mock.patch('datasets.dataset.random.random', side_effect=random_values), \
+                     mock.patch('datasets.dataset.random.sample', return_value=paths), \
+                     mock.patch('datasets.dataset.random.shuffle'):
+                    sample = dataset[0]
+                self.assertFalse(sample[5]['rich_compatible'])
+                trainer = Reg_Trainer.__new__(Reg_Trainer)
+                trainer.args = SimpleNamespace(rich_consistency_weight=0.,
+                    rich_loss_diagnostic_steps=0, rich_supervision_mode='repeat-class')
+                trainer.device = torch.device('cpu')
+                trainer.model = _DummyModel()
+                trainer.optimizer = torch.optim.SGD(trainer.model.parameters(), lr=.01)
+                trainer.dataloaders = {'train': [train_collate([sample])]}
+                trainer.epoch = 0
+                trainer.rich_prompt_config = None
+                trainer._rich_diagnostic_steps_logged = 0
+                with mock.patch('utils.regression_trainer._t2i_loss_components',
+                                side_effect=_fake_t2i_components):
+                    trainer.train_epoch()
+                self.assertEqual(len(trainer.model.calls), 1)
+                self.assertEqual(trainer.model.calls[0][1], (sample[2],))
+                self.assertTrue(torch.equal(trainer.model.calls[0][2].flatten(), sample[3]))
+
     def test_baseline_batch_keeps_one_forward_and_original_collate_shape(self):
         sample = (
             torch.zeros(1, 2, 2),
@@ -472,6 +548,9 @@ class ForwardAndLossTests(unittest.TestCase):
         self.assertEqual(trainer.model.calls[0][1], ('class-a', 'class-b'))
         self.assertEqual(trainer.model.calls[1][1], ('detailed-a',))
         self.assertEqual(trainer.model.calls[2][1], ('general-a',))
+        for call in trainer.model.calls[1:]:
+            self.assertTrue(torch.equal(call[2], torch.ones(1, 77, 1, 1)))
+            self.assertFalse(torch.equal(call[2], trainer.model.calls[0][2][:1]))
         self.assertTrue(torch.equal(
             trainer.model.calls[1][0], torch.ones(1, 1, 2, 2)
         ))
@@ -531,6 +610,39 @@ class ForwardAndLossTests(unittest.TestCase):
 
 
 class ResumeAndCliTests(unittest.TestCase):
+    def test_repeat_class_requires_validated_bank_path_and_zero_consistency(self):
+        for extra, message in (([], 'requires --rich-prompt-bank'),
+                (['--rich-prompt-bank', 'bank.json', '--rich-consistency-weight', '.1'],
+                 'requires --rich-consistency-weight 0')):
+            with self.assertRaisesRegex(ValueError, message):
+                parse_arg(['--rich-supervision-mode', 'repeat-class'] + extra)
+        args = parse_arg(['--rich-supervision-mode', 'repeat-class',
+                          '--rich-prompt-bank', 'bank.json'])
+        self.assertEqual(args.rich_supervision_mode, 'repeat-class')
+        self.assertEqual(parse_arg([]).rich_supervision_mode, 'rich')
+
+    def test_resume_modes_and_legacy_rich_compatibility(self):
+        historical = dict(prompt_bank_fingerprint='bank', selected_image_fingerprint='subset',
+            protocol_version=RICH_PROMPT_PROTOCOL, rich_consistency_weight=0.,
+            train_samples=1000, train_subset_seed=3407)
+        rich = dict(historical, rich_supervision_mode='rich')
+        repeat = dict(historical, rich_supervision_mode='repeat-class')
+        for current, saved in ((rich, historical), (historical, rich),
+                               (rich, rich), (repeat, repeat)):
+            validate_resume_rich_config(current, saved)
+        for current, saved in ((repeat, rich), (rich, repeat), (repeat, historical)):
+            with self.assertRaisesRegex(RichPromptTrainingError, 'rich_supervision_mode'):
+                validate_resume_rich_config(current, saved)
+        trainer = Reg_Trainer.__new__(Reg_Trainer)
+        trainer.rich_prompt_config = repeat
+        trainer.model, trainer.optimizer = mock.Mock(), mock.Mock()
+        with mock.patch('utils.regression_trainer.load_trusted_legacy_checkpoint',
+                        return_value={'rich_prompt_config': rich}):
+            with self.assertRaisesRegex(RichPromptTrainingError, 'rich_supervision_mode'):
+                trainer._load_training_checkpoint('historical.tar')
+        trainer.model.load_state_dict.assert_not_called()
+        trainer.optimizer.load_state_dict.assert_not_called()
+
     def test_rich_cli_is_opt_in_with_zero_weight_and_diagnostic_defaults(self):
         with mock.patch('sys.argv', ['train.py']):
             args = parse_arg()
@@ -577,6 +689,10 @@ class ResumeAndCliTests(unittest.TestCase):
         self.assertEqual(config['rich_consistency_weight'], 0.25)
         self.assertEqual(config['train_samples'], 1000)
         self.assertEqual(config['train_subset_seed'], 3407)
+        self.assertEqual(config['rich_supervision_mode'], 'rich')
+        repeated = build_rich_checkpoint_config(bank, 0., 1000, 3407,
+                                                supervision_mode='repeat-class')
+        self.assertEqual(repeated['rich_supervision_mode'], 'repeat-class')
 
     def test_resume_rejects_before_mutating_model_or_optimizer(self):
         trainer = Reg_Trainer.__new__(Reg_Trainer)
@@ -608,6 +724,61 @@ class ResumeAndCliTests(unittest.TestCase):
                 trainer._load_training_checkpoint('resume.tar')
         trainer.model.load_state_dict.assert_not_called()
         trainer.optimizer.load_state_dict.assert_not_called()
+
+
+class PreflightTests(unittest.TestCase):
+    def run_probe(self, model):
+        trainer = Reg_Trainer.__new__(Reg_Trainer)
+        trainer.model = model
+        trainer.device = torch.device('cpu')
+        trainer.args = SimpleNamespace(rich_loss_diagnostic_steps=0)
+        # A genuine one-sample compatible batch, including all metadata fields.
+        batch = train_collate([tuple(field[0] if not isinstance(field, dict) else
+            {key: value[0] for key, value in field.items()}
+            for field in _training_batch([True, True]))])
+        initial = {n: t.detach().clone() for n, t in model.state_dict().items()}
+        start_rng = rng_digest()
+        with tempfile.TemporaryDirectory() as directory, mock.patch(
+                'utils.regression_trainer._t2i_loss_components',
+                side_effect=_fake_t2i_components):
+            snapshot = TensorSnapshot(model, directory)
+            result = compare_batch(trainer, batch, snapshot, directory)
+        self.assertEqual(rng_digest(), start_rng)
+        for name, tensor in model.state_dict().items():
+            self.assertTrue(torch.equal(tensor, initial[name]))
+        return result
+
+    def test_deterministic_probe_measures_equal_gradients_and_never_updates(self):
+        result = self.run_probe(_DummyModel())
+        self.assertTrue(result['skip_candidate'])
+        self.assertEqual(result['class_only']['loss'], 1.)
+        self.assertEqual(result['repeat_class']['loss_difference'], 0.)
+        self.assertLess(result['repeat_class']['gradients']['difference_norm'], 1e-6)
+        self.assertEqual(len(result['repeat_class']['forwards']), 3)
+
+    def test_probe_detects_forward_rng_and_gradient_difference(self):
+        class Stochastic(_DummyModel):
+            def forward(self, inputs, captions, prompt_mask):
+                return super().forward(inputs * torch.rand_like(inputs), captions, prompt_mask)
+        torch.manual_seed(3407)
+        result = self.run_probe(Stochastic())
+        self.assertFalse(result['skip_candidate'])
+        self.assertTrue(result['repeat_class']['rng_changed'])
+        self.assertGreater(result['repeat_class']['gradients']['difference_norm'], 1e-6)
+        self.assertTrue(result['class_only_replay']['numerically_close'])
+
+    def test_probe_detects_and_restores_forward_buffer_updates(self):
+        class Stateful(_DummyModel):
+            def __init__(self):
+                super().__init__()
+                self.register_buffer('counter', torch.tensor(0))
+            def forward(self, *args):
+                self.counter.add_(1)
+                return super().forward(*args)
+        result = self.run_probe(Stateful())
+        self.assertFalse(result['skip_candidate'])
+        self.assertEqual(result['repeat_class']['registered_tensors_changed'], ['counter'])
+        self.assertTrue(result['repeat_class']['forwards'][1]['buffers_changed'])
 
 
 if __name__ == '__main__':

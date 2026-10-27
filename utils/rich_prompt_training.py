@@ -189,6 +189,7 @@ def build_rich_checkpoint_config(
     consistency_weight: float,
     train_samples: int,
     train_subset_seed: int,
+    supervision_mode: str = 'rich',
 ) -> Dict[str, object]:
     """Return the auditable rich configuration stored in .tar checkpoints."""
     return {
@@ -198,6 +199,7 @@ def build_rich_checkpoint_config(
         "selected_image_fingerprint": bank.selected_image_fingerprint,
         "protocol_version": bank.protocol_version,
         "rich_consistency_weight": consistency_weight,
+        "rich_supervision_mode": supervision_mode,
         "train_samples": train_samples,
         "train_subset_seed": train_subset_seed,
     }
@@ -218,6 +220,16 @@ def validate_resume_rich_config(current, checkpoint) -> None:
     if not isinstance(checkpoint, Mapping):
         raise RichPromptTrainingError(
             "Resume checkpoint has invalid rich prompt configuration"
+        )
+
+    # Historical Phase 2B checkpoints predate this field and used rich prompts.
+    current_mode = current.get('rich_supervision_mode', 'rich')
+    checkpoint_mode = checkpoint.get('rich_supervision_mode', 'rich')
+    if (current_mode not in ('rich', 'repeat-class')
+            or checkpoint_mode != current_mode):
+        raise RichPromptTrainingError(
+            'Resume checkpoint has incompatible rich configuration: '
+            'rich_supervision_mode'
         )
 
     compatibility_keys = (
