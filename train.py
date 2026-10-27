@@ -1,5 +1,6 @@
 import argparse
 import torch
+from utils.rich_prompt_training import RICH_SUPERVISION_MODES
 from utils.regression_trainer import (
     Reg_Trainer,
     validate_checkpoint_interval,
@@ -55,8 +56,8 @@ def parse_arg(argv=None):
     parser.add_argument('--rich-prompt-bank', default=None,
                         help='validated Phase 2A prompt bank for opt-in rich training')
     parser.add_argument('--rich-supervision-mode', default='rich',
-                        choices=('rich', 'repeat-class'),
-                        help='auxiliary supervision: rich prompts or RP-008 repeated class prompts')
+                        choices=RICH_SUPERVISION_MODES,
+                        help='auxiliary supervision: rich, repeated class, or fixed class templates')
     parser.add_argument('--rich-consistency-weight', default=0.0, type=float,
                         help='weight for symmetric rich-prompt density consistency')
     parser.add_argument('--rich-loss-diagnostic-steps', default=0, type=int,

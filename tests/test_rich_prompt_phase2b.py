@@ -21,16 +21,19 @@ from utils.regression_trainer import (
 )
 from utils.rich_prompt_training import (
     RICH_PROMPT_PROTOCOL,
+    TEMPLATE_SCHEME_VERSION,
     RichPromptRecord,
     RichPromptTrainingError,
     ValidatedRichPromptBank,
     build_rich_checkpoint_config,
+    build_class_templates,
     load_rich_prompt_bank,
     ordered_image_fingerprint,
     validate_prompt_bank_metadata,
     validate_resume_rich_config,
 )
 from tools.preflight_repeat_class import TensorSnapshot, compare_batch, rng_digest
+from tools.smoke_template_diversity import SmokeTrainer, run_smoke_batch, parameter_fingerprint
 
 
 PILOT_FINGERPRINT = (
@@ -186,7 +189,7 @@ class PromptBankValidationTests(unittest.TestCase):
         self.assertRegex(bank.file_fingerprint, r'^sha256:[0-9a-f]{64}$')
 
 
-def _build_dataset(root, rich=True):
+def _build_dataset(root, rich=True, mode='rich'):
     names = ['source.jpg', 'same.jpg', 'other.jpg', 'fourth.jpg']
     classes = {
         'source.jpg': 'apples',
@@ -239,6 +242,7 @@ def _build_dataset(root, rich=True):
         concat_size=4,
         tokenizer=_Tokenizer(),
         rich_prompt_records=records,
+        rich_supervision_mode=mode,
     )
     dataset.train_transform_density = mock.Mock(
         return_value=(
@@ -386,7 +390,8 @@ def _training_batch(compatible=None):
     return baseline + (rich_batch,)
 
 
-def _run_training_batch(compatible=None, diagnostic_steps=0, mode='rich'):
+def _run_training_batch(compatible=None, diagnostic_steps=0, mode='rich',
+                        batch=None, model=None, loss_fn=_fake_t2i_components):
     trainer = Reg_Trainer.__new__(Reg_Trainer)
     trainer.args = SimpleNamespace(
         rich_consistency_weight=0.0,
@@ -394,9 +399,9 @@ def _run_training_batch(compatible=None, diagnostic_steps=0, mode='rich'):
         rich_supervision_mode=mode,
     )
     trainer.device = torch.device('cpu')
-    trainer.model = _DummyModel()
+    trainer.model = _DummyModel() if model is None else model
     trainer.optimizer = torch.optim.SGD(trainer.model.parameters(), lr=0.01)
-    trainer.dataloaders = {'train': [_training_batch(compatible)]}
+    trainer.dataloaders = {'train': [_training_batch(compatible) if batch is None else batch]}
     trainer.epoch = 0
     trainer.rich_prompt_config = (
         None if compatible is None else {'enabled': True}
@@ -407,7 +412,7 @@ def _run_training_batch(compatible=None, diagnostic_steps=0, mode='rich'):
         side_effect=lambda dataloader, description: _Progress(dataloader),
     ), mock.patch(
         'utils.regression_trainer._t2i_loss_components',
-        side_effect=_fake_t2i_components,
+        side_effect=loss_fn,
     ):
         trainer.train_epoch()
     return trainer
@@ -609,6 +614,194 @@ class ForwardAndLossTests(unittest.TestCase):
         self.assertIs(returned, loss)
 
 
+class TemplateDiversityTests(unittest.TestCase):
+    def test_exact_templates_preserve_case_plural_and_whitespace(self):
+        for caption in ('apples', 'Red apples', 'red  apples (fruit)', ' apples '):
+            expected = ('a photo of ' + caption, 'the ' + caption + ' in the image')
+            self.assertEqual(build_class_templates(caption), expected)
+            self.assertEqual(build_class_templates(caption), build_class_templates(caption))
+        for invalid in ('', '  ', None):
+            with self.assertRaises(ValueError):
+                build_class_templates(invalid)
+
+    def test_positive_templates_have_own_77_position_masks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            dataset = _build_dataset(Path(directory), mode='template-diversity')
+            with mock.patch('datasets.dataset.random.random', return_value=.9):
+                sample = dataset[0]
+        self.assertEqual(sample[2], 'apples')
+        metadata = sample[5]
+        self.assertTrue(metadata['rich_compatible'])
+        for field, expected, length in (
+            ('detailed', 'a photo of apples', 4),
+            ('generalized', 'the apples in the image', 5),
+        ):
+            self.assertEqual(metadata[field + '_prompt'], expected)
+            mask = metadata[field + '_prompt_attn_mask']
+            self.assertEqual(tuple(mask.shape), (77,))
+            self.assertEqual(mask.sum().item(), length)
+            self.assertEqual(mask[0].item(), 0)
+            self.assertEqual(mask[76].item(), 0)
+            self.assertTrue(torch.equal(mask, build_rich_prompt_attention_mask(_Tokenizer(), expected)))
+            self.assertFalse(torch.equal(mask, sample[3]))
+
+    def test_dataset_never_reads_bank_descriptions_and_is_image_independent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            dataset = _build_dataset(Path(directory), mode='template-diversity')
+            # Presence-only sentinel raises if any description attribute is read.
+            dataset.rich_prompt_records = {name: object() for name in dataset.rich_prompt_records}
+            with mock.patch('datasets.dataset.random.random', return_value=.9):
+                first, same_class = dataset[0], dataset[1]
+                repeated = dataset[0]
+        for field in ('detailed_prompt', 'generalized_prompt',
+                      'detailed_prompt_attn_mask', 'generalized_prompt_attn_mask'):
+            a, b, c = first[5][field], same_class[5][field], repeated[5][field]
+            if torch.is_tensor(a):
+                self.assertTrue(torch.equal(a, b) and torch.equal(a, c))
+            else:
+                self.assertEqual(a, b)
+                self.assertEqual(a, c)
+
+    def test_template_masks_use_established_long_prompt_truncation(self):
+        caption = ' '.join('token{}'.format(i) for i in range(100))
+        for template in build_class_templates(caption):
+            mask = build_rich_prompt_attention_mask(_Tokenizer(), template)
+            self.assertEqual(mask.sum().item(), 75)
+            self.assertEqual(mask[0].item(), 0)
+            self.assertEqual(mask[76].item(), 0)
+            self.assertTrue(torch.equal(mask, build_rich_prompt_attention_mask(_Tokenizer(), template)))
+
+    def test_positive_dataset_batch_runs_exactly_three_independent_forwards(self):
+        with tempfile.TemporaryDirectory() as directory:
+            dataset = _build_dataset(Path(directory), mode='template-diversity')
+            with mock.patch('datasets.dataset.random.random', return_value=.9):
+                sample = dataset[0]
+        with mock.patch('utils.regression_trainer.rich_consistency_loss') as consistency:
+            trainer = _run_training_batch(mode='template-diversity', batch=train_collate([sample]))
+        self.assertEqual([call[1] for call in trainer.model.calls],
+                         [('apples',), ('a photo of apples',), ('the apples in the image',)])
+        for call, expected in zip(trainer.model.calls[1:], build_class_templates('apples')):
+            self.assertTrue(torch.equal(call[0], trainer.model.calls[0][0]))
+            self.assertTrue(torch.equal(call[2].flatten(),
+                                       build_rich_prompt_attention_mask(_Tokenizer(), expected)))
+        consistency.assert_not_called()
+
+    def test_negatives_and_mosaics_match_existing_data_and_get_no_extra_forwards(self):
+        for branch in ('negative', 'mosaic', 'same-class'):
+            with self.subTest(branch=branch), tempfile.TemporaryDirectory() as directory:
+                dataset = _build_dataset(Path(directory))
+                if branch == 'mosaic':
+                    draws, paths = [.1, .1], dataset.im_list[1:4]
+                else:
+                    draws = [.1, .9]
+                    paths = [dataset.im_list[1 if branch == 'same-class' else 2]]
+                samples = []
+                for mode in ('rich', 'template-diversity'):
+                    dataset.rich_supervision_mode = mode
+                    with mock.patch('datasets.dataset.random.random', side_effect=draws), \
+                         mock.patch('datasets.dataset.random.sample', return_value=paths), \
+                         mock.patch('datasets.dataset.random.shuffle'):
+                        samples.append(dataset[0])
+                original, control = samples
+                for left, right in zip(original[:5], control[:5]):
+                    self.assertTrue(torch.equal(left, right) if torch.is_tensor(left) else left == right)
+                self.assertEqual(original[5]['rich_compatible'], control[5]['rich_compatible'])
+                trainer = _run_training_batch(mode='template-diversity', batch=train_collate([control]))
+                self.assertEqual(len(trainer.model.calls), 3 if branch == 'same-class' else 1)
+                if branch != 'same-class':
+                    self.assertEqual(control[5]['detailed_prompt'], '')
+                    self.assertEqual(control[5]['generalized_prompt_attn_mask'].sum().item(), 0)
+
+    def test_mixed_batch_uses_original_weighting_gt_and_no_consistency(self):
+        class CaptionModel(_DummyModel):
+            def forward(self, inputs, captions, mask):
+                outputs = super().forward(inputs, captions, mask)
+                factor = torch.tensor([2. if c.startswith('a photo of ') else
+                                       4. if c.startswith('the ') else 1. for c in captions])
+                return (outputs[0] * factor.view(-1, 1, 1, 1),) + outputs[1:]
+        batch = _training_batch([True, False])
+        for slot, index in (('detailed', 0), ('generalized', 1)):
+            batch[5][slot + '_prompt'] = tuple(build_class_templates(c)[index] for c in batch[2])
+            batch[5][slot + '_prompt_attn_mask'] = torch.stack([
+                build_rich_prompt_attention_mask(_Tokenizer(), text)
+                for text in batch[5][slot + '_prompt']])
+        losses_seen = []
+        def loss_fn(outputs, density, image_mask):
+            losses_seen.append((density.clone(), image_mask.clone()))
+            return _fake_t2i_components(outputs, density, image_mask)
+        with mock.patch('utils.regression_trainer.rich_consistency_loss') as consistency:
+            trainer = _run_training_batch([True, False], mode='template-diversity',
+                batch=batch, model=CaptionModel(), loss_fn=loss_fn)
+        # Compatible loss=(1+2+4)/3, incompatible loss=2, equally sample weighted.
+        self.assertAlmostEqual(trainer.model.scale.item(), 1 - .01 * (13 / 6), places=6)
+        self.assertEqual(len(losses_seen), 4)
+        for density, image_mask in losses_seen[1:]:
+            self.assertTrue(torch.equal(density, losses_seen[0][0][:1]))
+            self.assertTrue(torch.equal(image_mask, losses_seen[0][1][:1]))
+        consistency.assert_not_called()
+
+    def test_cli_requires_bank_and_zero_consistency(self):
+        with self.assertRaisesRegex(ValueError, 'requires --rich-prompt-bank'):
+            parse_arg(['--rich-supervision-mode', 'template-diversity'])
+        base = ['--rich-supervision-mode', 'template-diversity', '--rich-prompt-bank', 'bank.json']
+        self.assertEqual(parse_arg(base).rich_consistency_weight, 0.)
+        for weight in ('.1', '-1', 'nan'):
+            with self.assertRaisesRegex(ValueError, 'requires --rich-consistency-weight 0'):
+                parse_arg(base + ['--rich-consistency-weight', weight])
+
+    def test_checkpoint_scheme_and_all_cross_mode_resumes(self):
+        bank = ValidatedRichPromptBank('bank.json', 'bank-hash', 'subset-hash', RICH_PROMPT_PROTOCOL, {})
+        configs = {mode: build_rich_checkpoint_config(bank, 0., 1000, 3407, mode)
+                   for mode in ('rich', 'repeat-class', 'template-diversity')}
+        self.assertEqual(configs['template-diversity']['template_scheme_version'], TEMPLATE_SCHEME_VERSION)
+        self.assertNotIn('template_scheme_version', configs['rich'])
+        self.assertNotIn('template_scheme_version', configs['repeat-class'])
+        for current_mode, current in configs.items():
+            for saved_mode, saved in configs.items():
+                if current_mode == saved_mode:
+                    validate_resume_rich_config(current, saved)
+                else:
+                    with self.assertRaisesRegex(RichPromptTrainingError, 'rich_supervision_mode'):
+                        validate_resume_rich_config(current, saved)
+        current = configs['template-diversity']
+        for scheme in (None, 'class-name-templates-v2'):
+            saved = dict(current)
+            if scheme is None:
+                del saved['template_scheme_version']
+            else:
+                saved['template_scheme_version'] = scheme
+            with self.assertRaisesRegex(RichPromptTrainingError, 'template_scheme_version'):
+                validate_resume_rich_config(current, saved)
+        trainer = Reg_Trainer.__new__(Reg_Trainer)
+        trainer.rich_prompt_config = current
+        trainer.model, trainer.optimizer = mock.Mock(), mock.Mock()
+        with mock.patch('utils.regression_trainer.load_trusted_legacy_checkpoint',
+                        return_value={'rich_prompt_config': saved}):
+            with self.assertRaisesRegex(RichPromptTrainingError, 'template_scheme_version'):
+                trainer._load_training_checkpoint('wrong-scheme.tar')
+        trainer.model.load_state_dict.assert_not_called()
+        trainer.optimizer.load_state_dict.assert_not_called()
+
+    def test_template_mode_and_scheme_survive_full_checkpoint_round_trip(self):
+        from utils.checkpoints import load_trusted_legacy_checkpoint
+        bank = ValidatedRichPromptBank('bank.json', 'bank-hash', 'subset-hash', RICH_PROMPT_PROTOCOL, {})
+        with tempfile.TemporaryDirectory() as directory:
+            trainer = Reg_Trainer.__new__(Reg_Trainer)
+            trainer.rich_prompt_config = build_rich_checkpoint_config(
+                bank, 0., 1000, 3407, 'template-diversity')
+            trainer.model = _DummyModel()
+            trainer.optimizer = torch.optim.SGD(trainer.model.parameters(), lr=.01)
+            trainer.save_dir, trainer.save_list = directory, mock.Mock()
+            trainer.epoch, trainer.best_mae, trainer.best_mse = 0, 1., 2.
+            trainer._save_training_checkpoint()
+            path = str(Path(directory) / '0_ckpt.tar')
+            saved = load_trusted_legacy_checkpoint(path, 'cpu')['rich_prompt_config']
+            self.assertEqual(saved['rich_supervision_mode'], 'template-diversity')
+            self.assertEqual(saved['template_scheme_version'], TEMPLATE_SCHEME_VERSION)
+            trainer._load_training_checkpoint(path)
+            self.assertEqual(trainer.start_epoch, 1)
+
+
 class ResumeAndCliTests(unittest.TestCase):
     def test_repeat_class_requires_validated_bank_path_and_zero_consistency(self):
         for extra, message in (([], 'requires --rich-prompt-bank'),
@@ -724,6 +917,75 @@ class ResumeAndCliTests(unittest.TestCase):
                 trainer._load_training_checkpoint('resume.tar')
         trainer.model.load_state_dict.assert_not_called()
         trainer.optimizer.load_state_dict.assert_not_called()
+
+
+class TemplateSmokeTests(unittest.TestCase):
+    def fixture(self):
+        with tempfile.TemporaryDirectory() as directory:
+            dataset = _build_dataset(Path(directory), mode='template-diversity')
+            with mock.patch('datasets.dataset.random.random', return_value=.9):
+                sample = dataset[0]
+        sample = (torch.ones_like(sample[0]),) + sample[1:]
+        trainer = SmokeTrainer.__new__(SmokeTrainer)
+        trainer.model = _DummyModel()
+        trainer.optimizer = torch.optim.SGD(trainer.model.parameters(), lr=.01)
+        trainer.device = torch.device('cpu')
+        trainer.args = SimpleNamespace(rich_supervision_mode='template-diversity',
+                                      rich_consistency_weight=0., rich_loss_diagnostic_steps=0)
+        trainer.rich_prompt_config = None
+        trainer._rich_diagnostic_steps_logged = 0
+        return trainer, train_collate([sample])
+
+    def test_smoke_checks_three_forwards_backward_and_unchanged_parameters(self):
+        trainer, batch = self.fixture()
+        initial = parameter_fingerprint(trainer.model)
+        with mock.patch('utils.regression_trainer._t2i_loss_components',
+                        side_effect=_fake_t2i_components):
+            result = run_smoke_batch(trainer, batch, _Tokenizer())
+        self.assertEqual(result['status'], 'PASS')
+        self.assertEqual(result['optimizer_steps'], 0)
+        self.assertTrue(result['backward_completed'])
+        self.assertEqual(result['initial_parameter_fingerprint'], initial)
+        self.assertEqual(result['final_parameter_fingerprint'], initial)
+        self.assertEqual(result['gradients']['gradient_l2'], 1.)
+        self.assertEqual([f['caption'] for f in result['forwards']],
+                         ['apples', 'a photo of apples', 'the apples in the image'])
+        self.assertEqual([f['mask_tokens'] for f in result['forwards']], [1., 4., 5.])
+        self.assertEqual(len(result['supervised_components']), 4)
+        self.assertFalse(trainer.optimizer.state)
+
+    def test_smoke_rejects_reused_class_mask_for_template(self):
+        trainer, batch = self.fixture()
+        batch[5]['detailed_prompt_attn_mask'] = batch[3].clone()
+        with self.assertRaisesRegex(ValueError, 'Incorrect template attention mask'):
+            run_smoke_batch(trainer, batch, _Tokenizer())
+        self.assertEqual(len(trainer.model.calls), 0)
+
+    def test_smoke_guard_blocks_even_accidental_production_optimizer_step(self):
+        trainer, batch = self.fixture()
+        initial = parameter_fingerprint(trainer.model)
+        trainer._optimize_batch = lambda loss: Reg_Trainer._optimize_batch(trainer, loss)
+        with mock.patch('utils.regression_trainer._t2i_loss_components',
+                        side_effect=_fake_t2i_components):
+            with self.assertRaisesRegex(AssertionError, 'Optimizer step is forbidden'):
+                run_smoke_batch(trainer, batch, _Tokenizer())
+        self.assertEqual(parameter_fingerprint(trainer.model), initial)
+
+    def test_smoke_rejects_nonfinite_loss(self):
+        trainer, batch = self.fixture()
+        def nonfinite(*args):
+            return dict(reg=torch.tensor(float('nan')), rrc1=torch.tensor(0.),
+                        rrc2=torch.tensor(0.), total=torch.tensor(float('nan')))
+        with mock.patch('utils.regression_trainer._t2i_loss_components', side_effect=nonfinite):
+            with self.assertRaisesRegex(ValueError, 'Nonfinite supervised loss'):
+                run_smoke_batch(trainer, batch, _Tokenizer())
+
+    def test_parameter_fingerprint_detects_weight_changes(self):
+        trainer, _ = self.fixture()
+        initial = parameter_fingerprint(trainer.model)
+        with torch.no_grad():
+            trainer.model.scale.add_(.01)
+        self.assertNotEqual(parameter_fingerprint(trainer.model), initial)
 
 
 class PreflightTests(unittest.TestCase):

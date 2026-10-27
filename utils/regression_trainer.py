@@ -18,6 +18,7 @@ from utils.ssim_loss import cal_avg_ms_ssim
 from utils.inference import predict_count
 from utils.train_subset import select_train_subset_indices
 from utils.rich_prompt_training import (
+    RICH_SUPERVISION_MODES,
     build_rich_checkpoint_config,
     load_rich_prompt_bank,
     validate_resume_rich_config,
@@ -122,13 +123,14 @@ def validate_train_sample_options(args):
     consistency_weight = getattr(args, 'rich_consistency_weight', 0.0)
     diagnostic_steps = getattr(args, 'rich_loss_diagnostic_steps', 0)
     supervision_mode = getattr(args, 'rich_supervision_mode', 'rich')
-    if supervision_mode not in ('rich', 'repeat-class'):
+    if supervision_mode not in RICH_SUPERVISION_MODES:
         raise ValueError('Invalid --rich-supervision-mode.')
-    if supervision_mode == 'repeat-class':
+    if supervision_mode in ('repeat-class', 'template-diversity'):
         if not rich_prompt_bank:
-            raise ValueError('--rich-supervision-mode repeat-class requires --rich-prompt-bank.')
+            raise ValueError('--rich-supervision-mode {} requires --rich-prompt-bank.'.format(
+                supervision_mode))
         if consistency_weight != 0.0:
-            raise ValueError('repeat-class requires --rich-consistency-weight 0.')
+            raise ValueError('{} requires --rich-consistency-weight 0.'.format(supervision_mode))
     if not math.isfinite(consistency_weight) or consistency_weight < 0:
         raise ValueError('--rich-consistency-weight must be finite and non-negative.')
     if diagnostic_steps < 0:
@@ -371,6 +373,9 @@ class Reg_Trainer(Trainer):
             base_train_dataset.rich_prompt_records = (
                 self.rich_prompt_bank.records
             )
+            base_train_dataset.rich_supervision_mode = getattr(
+                args, 'rich_supervision_mode', 'rich'
+            )
             self.rich_prompt_config = build_rich_checkpoint_config(
                 self.rich_prompt_bank,
                 consistency_weight=args.rich_consistency_weight,
@@ -608,9 +613,12 @@ class Reg_Trainer(Trainer):
                         )
                         detailed_loss = detailed_components['total']
                         generalized_loss = generalized_components['total']
-                        if getattr(args, 'rich_supervision_mode', 'rich') == 'repeat-class':
+                        if getattr(args, 'rich_supervision_mode', 'rich') in (
+                            'repeat-class', 'template-diversity'
+                        ):
                             if args.rich_consistency_weight != 0.0:
-                                raise ValueError('repeat-class requires --rich-consistency-weight 0.')
+                                raise ValueError('{} requires --rich-consistency-weight 0.'.format(
+                                    args.rich_supervision_mode))
                             consistency_terms = {'mean': detailed_loss.new_zeros(())}
                         else:
                             consistency_terms = rich_consistency_loss(

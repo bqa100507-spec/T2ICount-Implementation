@@ -15,6 +15,7 @@ import math
 from pathlib import Path
 
 from utils.clip import load_clip_tokenizer
+from utils.rich_prompt_training import RICH_SUPERVISION_MODES, build_class_templates
 
 
 def random_crop(im_h, im_w, crop_h, crop_w):
@@ -27,7 +28,8 @@ def random_crop(im_h, im_w, crop_h, crop_w):
 
 class ObjectCount(Dataset):
     def __init__(self, root, crop_size, downsample_ratio, method='train', concat_size=224,
-                 tokenizer=None, clip_path=None, rich_prompt_records=None):
+                 tokenizer=None, clip_path=None, rich_prompt_records=None,
+                 rich_supervision_mode='rich'):
         super(ObjectCount, self).__init__()
         #self.im_list = sorted(glob(os.path.join(root, 'images/*.jpg')))
         assert crop_size % downsample_ratio == 0
@@ -46,6 +48,9 @@ class ObjectCount(Dataset):
         if rich_prompt_records is not None and method != 'train':
             raise ValueError('Rich prompts are supported only for training.')
         self.rich_prompt_records = rich_prompt_records
+        if rich_supervision_mode not in RICH_SUPERVISION_MODES:
+            raise ValueError('Invalid rich supervision mode.')
+        self.rich_supervision_mode = rich_supervision_mode
 
         with open(os.path.join(root, 'FSC_147/Train_Test_Val_FSC_147.json'), 'r') as f:
             data_split = json.load(f)[method]
@@ -164,12 +169,20 @@ class ObjectCount(Dataset):
                     )
                 )
             rich_compatible = rich_compatible and prompt == cls_name
+            if self.rich_supervision_mode == 'template-diversity':
+                # The validated record establishes provenance/presence only.
+                # Never read its detailed/generalized text in RP-009.
+                detailed_prompt, generalized_prompt = (
+                    build_class_templates(prompt) if rich_compatible else ('', '')
+                )
+            else:
+                detailed_prompt, generalized_prompt = record.detailed, record.generalized
             if rich_compatible:
                 detailed_mask = build_rich_prompt_attention_mask(
-                    self.tokenizer, record.detailed
+                    self.tokenizer, detailed_prompt
                 )
                 generalized_mask = build_rich_prompt_attention_mask(
-                    self.tokenizer, record.generalized
+                    self.tokenizer, generalized_prompt
                 )
             else:
                 detailed_mask = torch.zeros(77)
@@ -177,8 +190,8 @@ class ObjectCount(Dataset):
             rich_metadata = {
                 'source_image_name': source_image_name,
                 'rich_compatible': rich_compatible,
-                'detailed_prompt': record.detailed,
-                'generalized_prompt': record.generalized,
+                'detailed_prompt': detailed_prompt,
+                'generalized_prompt': generalized_prompt,
                 'detailed_prompt_attn_mask': detailed_mask,
                 'generalized_prompt_attn_mask': generalized_mask,
             }

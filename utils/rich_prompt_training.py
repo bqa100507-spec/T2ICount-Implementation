@@ -10,6 +10,16 @@ from typing import Dict, Mapping, Sequence
 FSC147_BENCHMARK = "FSC147"
 TRAIN_SPLIT = "train"
 RICH_PROMPT_PROTOCOL = "rich-prompt-phase1-v3"
+RICH_SUPERVISION_MODES = ('rich', 'repeat-class', 'template-diversity')
+TEMPLATE_SCHEME_VERSION = 'class-name-templates-v1'
+
+
+def build_class_templates(class_caption: str):
+    """RP-009: preserve the exact class caption, adding only fixed wrappers."""
+    if not isinstance(class_caption, str) or not class_caption.strip():
+        raise ValueError('Class caption must be a non-empty string.')
+    return ('a photo of {}'.format(class_caption),
+            'the {} in the image'.format(class_caption))
 
 
 class RichPromptTrainingError(ValueError):
@@ -192,7 +202,7 @@ def build_rich_checkpoint_config(
     supervision_mode: str = 'rich',
 ) -> Dict[str, object]:
     """Return the auditable rich configuration stored in .tar checkpoints."""
-    return {
+    config = {
         "prompt_bank_path": bank.path,
         "prompt_bank_filename": Path(bank.path).name,
         "prompt_bank_fingerprint": bank.file_fingerprint,
@@ -203,6 +213,9 @@ def build_rich_checkpoint_config(
         "train_samples": train_samples,
         "train_subset_seed": train_subset_seed,
     }
+    if supervision_mode == 'template-diversity':
+        config['template_scheme_version'] = TEMPLATE_SCHEME_VERSION
+    return config
 
 
 def validate_resume_rich_config(current, checkpoint) -> None:
@@ -225,11 +238,20 @@ def validate_resume_rich_config(current, checkpoint) -> None:
     # Historical Phase 2B checkpoints predate this field and used rich prompts.
     current_mode = current.get('rich_supervision_mode', 'rich')
     checkpoint_mode = checkpoint.get('rich_supervision_mode', 'rich')
-    if (current_mode not in ('rich', 'repeat-class')
+    if (current_mode not in RICH_SUPERVISION_MODES
             or checkpoint_mode != current_mode):
         raise RichPromptTrainingError(
             'Resume checkpoint has incompatible rich configuration: '
             'rich_supervision_mode'
+        )
+
+    if current_mode == 'template-diversity' and (
+        current.get('template_scheme_version') != TEMPLATE_SCHEME_VERSION
+        or checkpoint.get('template_scheme_version') != TEMPLATE_SCHEME_VERSION
+    ):
+        raise RichPromptTrainingError(
+            'Resume checkpoint has incompatible rich configuration: '
+            'template_scheme_version'
         )
 
     compatibility_keys = (
