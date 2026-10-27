@@ -29,6 +29,8 @@ at the time stated. `MSE` in legacy T2ICount logs denotes RMSE.
 | RP-005 | Multi-prompt consistency, `lambda_cons=1` | CLOSED / INFORMATIVE | Agreement improved; class accuracy degraded |
 | RP-006 | Multi-prompt consistency, `lambda_cons=100` | CLOSED-NEGATIVE | Degenerate agreement without correctness |
 | RP-007 | Consistency-loss synthesis | CLOSED | Stop raw weight search |
+| RP-008 | Matched repeat-class three-forward control | CLOSED / PREFLIGHT-REVIEW | GPU preflight REVIEW; full training not run by researcher decision |
+| RP-009 | Deterministic generic-template diversity control | CLOSED / INFORMATIVE | Full 1000x10 run completed; does not reproduce RP-003 test gains |
 | ALIGN-000 | Initial raw FFN + Adapter smoke | OBSOLETE | Debug history, not scientific evidence |
 | ALIGN-001 | Embedding normalization / metric diagnostic | CLOSED / INFORMATIVE | Frozen CLIP has strong global alignment |
 | ALIGN-002 | Random-FFN initialization / margin diagnostic | CLOSED / INFORMATIVE | Initialization destroys CLIP geometry; old conclusion obsolete |
@@ -1373,3 +1375,168 @@ scientific approval of a next experiment.
 ### Status
 
 ACTIVE-CANDIDATE
+
+## RP-008 — Repeat-class control, GPU preflight (2026-10-27)
+
+### Question
+
+Could RP-003's apparent class-name counting improvement be attributable to the
+three-forward loss weighting/procedure rather than different semantic content?
+
+### Hypothesis and change
+
+For compatible positive samples, repeat the original class caption and exact
+class attention mask in all three supervised forwards, retaining RP-003's
+density/RRC loss and \`lambda_cons=0\`. Compare against a class-only forward
+on identical batches with no optimizer steps.
+
+### Controls
+
+Same validated FSC147 1000-sample prompt bank, selected subset, seeds 3407,
+training configuration and compatible-positive routing; text-negatives and
+mosaic samples are not given auxiliary supervision. Executed the
+\`tools/preflight_repeat_class.py\` GPU diagnostic only, **not** a 10-epoch run.
+
+### Result
+
+- Two compatible batches on NVIDIA L4, Torch \`2.11.0+cu130\`, code commit
+  \`b8aa367ba36f24dc33a7fc22079c045bf596214a\`.
+- Class-only and repeat-class scalar losses matched on each tested batch:
+  0.48229784 and 0.47746667, respectively.
+- Repeat-class versus class-only full-gradient relative L2 differences:
+  0.00045079 and 0.00060740 (approximately 0.0451% and 0.0607%).
+- Even class-only replay versus class-only reference produced relative
+  differences 6.74e-6 and 8.96e-6. No RNG or registered model-state
+  changes were observed in these tested forwards.
+- Official diagnostic recommendation: **REVIEW**, rather than \`SKIP\`.
+  Compatible batches: 2/2; optimizer updates: 0.
+- No full RP-008 training, validation, or test metrics exist.
+
+### Interpretation and limits
+
+These two probes support matching scalar objectives and small observed
+gradient differences; they do **not** establish bitwise equivalence or
+equivalent training trajectories. Small differences may reflect GPU numerical
+variation or execution ordering; the source has not been isolated. A
+preflight-only control does not explain RP-003's test improvement.
+
+### Decision
+
+Researcher reviewed the \`REVIEW\` result and chose to forgo the full 10-epoch
+RP-008 run in favor of a generic-template control. Do not relabel the
+diagnostic \`SKIP\`, numerical equivalence, or a completed full-run comparison.
+
+### Artifacts
+
+- Colab output:
+  \`/content/drive/MyDrive/T2ICount-assets/outputs/rp008_preflight.json\`.
+- Preflight setup log:
+  \`/content/drive/MyDrive/T2ICount-assets/checkpoints/rich_prompt/preflight/rp008_preflight/train.log\`.
+- Preparation document: \`docs/RP008_PREPARATION.md\`.
+
+### Status
+
+CLOSED / PREFLIGHT-REVIEW (FULL RUN NOT EXECUTED)
+
+## RP-009 — Generic template diversity control (2026-10-27)
+
+### Question
+
+Can the class-name counting gain recorded for RP-003 be reproduced using
+generic variations of class text, without image-specific detailed/generalized
+rich semantics?
+
+### Hypothesis and change
+
+For each compatible positive, retain the original class caption plus exactly:
+
+- \`a photo of {class_name}\`;
+- \`the {class_name} in the image\`.
+
+Use separate CLIP masks, the unchanged RP-003 three-forward density/RRC loss
+and weighting, and \`lambda_cons=0\`. All inference and checkpoint selection
+use short class-name captions. The original rich prompt bank is retained only
+for validated sample/subset and compatibility provenance.
+
+### Controls and provenance
+
+FSC147 1000-sample subset, subset/training seeds 3407, batch size 1,
+10 epochs (zero-based 0-9), LR 5e-5, weight decay 5e-4, original
+AdamW U-Net/decoder groups, augmentation, density targets, compatible-positive
+routing, evaluator, and validation schedule (epochs 7-9). Best checkpoint
+selected by validation MAE + RMSE. Implementation:
+\`d9601df91bfefa58f823eaf021cca617b6394ac7\` on
+\`rich-prompt-alignment\`; template scheme \`class-name-templates-v1\`.
+The original bank file fingerprint was
+\`sha256:c3ec587b37fd9f351cdedbce888b26e0ba7a020de956c4ef18202a1268e7e32f\`.
+
+Local preparation reported 152 passing tests and 2000/2000 template masks
+verified against the CLIP tokenizer. A real-model, one-compatible-batch
+NVIDIA L4 GPU smoke passed with three verified captions/masks, finite loss
+and gradients, zero optimizer steps, and equal pre/post parameter fingerprints.
+Full training subsequently executed separately.
+
+### Result
+
+| Epoch | Train MAE | Train RMSE | Val MAE | Val RMSE |
+| ---: | ---: | ---: | ---: | ---: |
+| 7 | 17.17 | 38.10 | **23.50** | **82.80** |
+| 8 | 17.70 | 42.36 | 26.44 | 101.45 |
+| 9 | 17.33 | 40.55 | 25.12 | 96.88 |
+
+- Best model: \`best_model_7.pth\`, selected at epoch 7; the training log
+  recorded standard FSC147 **test MAE 23.45 / RMSE 115.18** for that model.
+- The full 10-epoch run finished after the epoch-9 validation on 2026-10-27
+  (log timestamps in UTC), in approximately 4 h 06 min.
+- Mean compatible-positive fraction during training was around 50%-54%.
+  The logged auxiliary consistency term was zero.
+- No FSC147-S results or per-image prediction/error analysis were recorded
+  for this RP-009 run.
+
+### Comparison and interpretation
+
+| Run | Standard FSC147 test MAE | Standard FSC147 test RMSE |
+| --- | ---: | ---: |
+| BASE-002 class-only | 22.82 | 120.25 |
+| RP-003 rich supervision, \`lambda_cons=0\` | **19.98** | **107.13** |
+| RP-009 generic templates, \`lambda_cons=0\` | 23.45 | 115.18 |
+
+RP-009 versus BASE-002: test MAE was 0.63 worse, RMSE 5.07 better
+(a mixed result). RP-009 versus RP-003: MAE was 3.47 worse and
+RMSE 8.05 worse. This particular generic-template training procedure
+**did not reproduce RP-003's recorded gains**.
+
+### What this proves / does NOT prove
+
+The three-forward counting pipeline can train with deterministic generic
+templates, and its observed class-name test result falls short of RP-003's
+recorded test result. This makes simple generic-template diversity an
+insufficient explanation **in these runs**, but does **not** prove that
+image-specific rich semantics caused RP-003's gain. Historical RP-003
+initialization/runtime/provenance are incomplete; comparisons are single-run,
+and the text lengths/embedding distributions still differ. Test-set metric
+differences are descriptive, not a significance or causal claim.
+
+### Decision
+
+Researcher reviewed the result and accepted RP-009 as an informative control.
+Do not repeat the identical template condition without a new hypothesis.
+Before new expensive causal-attribution experiments, prioritize provenance-
+matched comparisons and low-cost diagnostics; any future experiment needs its
+own approved specification.
+
+### Artifacts
+
+- Training log:
+  \`/content/drive/MyDrive/T2ICount-assets/checkpoints/rich_prompt/rp009/template_diversity_1000x10_v1/train.log\`.
+- Best weights:
+  \`/content/drive/MyDrive/T2ICount-assets/checkpoints/rich_prompt/rp009/template_diversity_1000x10_v1/best_model_7.pth\`.
+- Full resumable checkpoints in the same directory:
+  \`0_ckpt.tar\`, \`5_ckpt.tar\`.
+- Smoke JSON:
+  \`/content/drive/MyDrive/T2ICount-assets/outputs/rp009/smoke_template_diversity_v1.json\`.
+- Preparation: \`docs/RP009_PREPARATION.md\`.
+
+### Status
+
+CLOSED / INFORMATIVE
