@@ -1387,7 +1387,7 @@ three-forward loss weighting/procedure rather than different semantic content?
 
 For compatible positive samples, repeat the original class caption and exact
 class attention mask in all three supervised forwards, retaining RP-003's
-density/RRC loss and \`lambda_cons=0\`. Compare against a class-only forward
+density/RRC loss and `lambda_cons=0`. Compare against a class-only forward
 on identical batches with no optimizer steps.
 
 ### Controls
@@ -1395,12 +1395,12 @@ on identical batches with no optimizer steps.
 Same validated FSC147 1000-sample prompt bank, selected subset, seeds 3407,
 training configuration and compatible-positive routing; text-negatives and
 mosaic samples are not given auxiliary supervision. Executed the
-\`tools/preflight_repeat_class.py\` GPU diagnostic only, **not** a 10-epoch run.
+`tools/preflight_repeat_class.py` GPU diagnostic only, **not** a 10-epoch run.
 
 ### Result
 
-- Two compatible batches on NVIDIA L4, Torch \`2.11.0+cu130\`, code commit
-  \`b8aa367ba36f24dc33a7fc22079c045bf596214a\`.
+- Two compatible batches on NVIDIA L4, Torch `2.11.0+cu130`, code commit
+  `b8aa367ba36f24dc33a7fc22079c045bf596214a`.
 - Class-only and repeat-class scalar losses matched on each tested batch:
   0.48229784 and 0.47746667, respectively.
 - Repeat-class versus class-only full-gradient relative L2 differences:
@@ -1408,7 +1408,7 @@ mosaic samples are not given auxiliary supervision. Executed the
 - Even class-only replay versus class-only reference produced relative
   differences 6.74e-6 and 8.96e-6. No RNG or registered model-state
   changes were observed in these tested forwards.
-- Official diagnostic recommendation: **REVIEW**, rather than \`SKIP\`.
+- Official diagnostic recommendation: **REVIEW**, rather than `SKIP`.
   Compatible batches: 2/2; optimizer updates: 0.
 - No full RP-008 training, validation, or test metrics exist.
 
@@ -1422,17 +1422,17 @@ preflight-only control does not explain RP-003's test improvement.
 
 ### Decision
 
-Researcher reviewed the \`REVIEW\` result and chose to forgo the full 10-epoch
+Researcher reviewed the `REVIEW` result and chose to forgo the full 10-epoch
 RP-008 run in favor of a generic-template control. Do not relabel the
-diagnostic \`SKIP\`, numerical equivalence, or a completed full-run comparison.
+diagnostic `SKIP`, numerical equivalence, or a completed full-run comparison.
 
 ### Artifacts
 
 - Colab output:
-  \`/content/drive/MyDrive/T2ICount-assets/outputs/rp008_preflight.json\`.
+  `/content/drive/MyDrive/T2ICount-assets/outputs/rp008_preflight.json`.
 - Preflight setup log:
-  \`/content/drive/MyDrive/T2ICount-assets/checkpoints/rich_prompt/preflight/rp008_preflight/train.log\`.
-- Preparation document: \`docs/RP008_PREPARATION.md\`.
+  `/content/drive/MyDrive/T2ICount-assets/checkpoints/rich_prompt/preflight/rp008_preflight/train.log`.
+- Preparation document: `docs/RP008_PREPARATION.md`.
 
 ### Status
 
@@ -1450,11 +1450,11 @@ rich semantics?
 
 For each compatible positive, retain the original class caption plus exactly:
 
-- \`a photo of {class_name}\`;
-- \`the {class_name} in the image\`.
+- `a photo of {class_name}`;
+- `the {class_name} in the image`.
 
 Use separate CLIP masks, the unchanged RP-003 three-forward density/RRC loss
-and weighting, and \`lambda_cons=0\`. All inference and checkpoint selection
+and weighting, and `lambda_cons=0`. All inference and checkpoint selection
 use short class-name captions. The original rich prompt bank is retained only
 for validated sample/subset and compatibility provenance.
 
@@ -1465,10 +1465,10 @@ FSC147 1000-sample subset, subset/training seeds 3407, batch size 1,
 AdamW U-Net/decoder groups, augmentation, density targets, compatible-positive
 routing, evaluator, and validation schedule (epochs 7-9). Best checkpoint
 selected by validation MAE + RMSE. Implementation:
-\`d9601df91bfefa58f823eaf021cca617b6394ac7\` on
-\`rich-prompt-alignment\`; template scheme \`class-name-templates-v1\`.
+`d9601df91bfefa58f823eaf021cca617b6394ac7` on
+`rich-prompt-alignment`; template scheme `class-name-templates-v1`.
 The original bank file fingerprint was
-\`sha256:c3ec587b37fd9f351cdedbce888b26e0ba7a020de956c4ef18202a1268e7e32f\`.
+`sha256:c3ec587b37fd9f351cdedbce888b26e0ba7a020de956c4ef18202a1268e7e32f`.
 
 Local preparation reported 152 passing tests and 2000/2000 template masks
 verified against the CLIP tokenizer. A real-model, one-compatible-batch
@@ -1484,7 +1484,7 @@ Full training subsequently executed separately.
 | 8 | 17.70 | 42.36 | 26.44 | 101.45 |
 | 9 | 17.33 | 40.55 | 25.12 | 96.88 |
 
-- Best model: \`best_model_7.pth\`, selected at epoch 7; the training log
+- Best model: `best_model_7.pth`, selected at epoch 7; the training log
   recorded standard FSC147 **test MAE 23.45 / RMSE 115.18** for that model.
 - The full 10-epoch run finished after the epoch-9 validation on 2026-10-27
   (log timestamps in UTC), in approximately 4 h 06 min.
@@ -1498,8 +1498,8 @@ Full training subsequently executed separately.
 | Run | Standard FSC147 test MAE | Standard FSC147 test RMSE |
 | --- | ---: | ---: |
 | BASE-002 class-only | 22.82 | 120.25 |
-| RP-003 rich supervision, \`lambda_cons=0\` | **19.98** | **107.13** |
-| RP-009 generic templates, \`lambda_cons=0\` | 23.45 | 115.18 |
+| RP-003 rich supervision, `lambda_cons=0` | **19.98** | **107.13** |
+| RP-009 generic templates, `lambda_cons=0` | 23.45 | 115.18 |
 
 RP-009 versus BASE-002: test MAE was 0.63 worse, RMSE 5.07 better
 (a mixed result). RP-009 versus RP-003: MAE was 3.47 worse and
@@ -1528,14 +1528,14 @@ own approved specification.
 ### Artifacts
 
 - Training log:
-  \`/content/drive/MyDrive/T2ICount-assets/checkpoints/rich_prompt/rp009/template_diversity_1000x10_v1/train.log\`.
+  `/content/drive/MyDrive/T2ICount-assets/checkpoints/rich_prompt/rp009/template_diversity_1000x10_v1/train.log`.
 - Best weights:
-  \`/content/drive/MyDrive/T2ICount-assets/checkpoints/rich_prompt/rp009/template_diversity_1000x10_v1/best_model_7.pth\`.
+  `/content/drive/MyDrive/T2ICount-assets/checkpoints/rich_prompt/rp009/template_diversity_1000x10_v1/best_model_7.pth`.
 - Full resumable checkpoints in the same directory:
-  \`0_ckpt.tar\`, \`5_ckpt.tar\`.
+  `0_ckpt.tar`, `5_ckpt.tar`.
 - Smoke JSON:
-  \`/content/drive/MyDrive/T2ICount-assets/outputs/rp009/smoke_template_diversity_v1.json\`.
-- Preparation: \`docs/RP009_PREPARATION.md\`.
+  `/content/drive/MyDrive/T2ICount-assets/outputs/rp009/smoke_template_diversity_v1.json`.
+- Preparation: `docs/RP009_PREPARATION.md`.
 
 ### Status
 
