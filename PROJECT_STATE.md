@@ -393,24 +393,63 @@ HSCM semantic correction, the counter/density output, or the mismatch between
 CLIP-based Stage-1 alignment and T2ICount's diffusion-based visual path. No one
 location has been proven.
 
+## RP-008 / RP-009 reviewed counting controls (2026-10-28)
+
+The researcher reviewed two new controls after the earlier RP-003 attribution
+question. Source details, limitations, and artifacts are recorded append-only
+in `EXPERIMENT_LEDGER.md`.
+
+- **RP-008, preflight only:** repeat original class text/mask across three
+  supervised forwards with `lambda_cons=0`. Two compatible L4 GPU probes
+  gave identical scalar losses and small gradient differences, including
+  differences on class-only replay. Official script result was `REVIEW`,
+  not numerical equivalence or `SKIP`; zero optimizer steps. The researcher
+  chose **not to run** the full 10-epoch RP-008 condition.
+- **RP-009, full 1000x10:** replace detailed/generalized descriptions with
+  deterministic generic class-based templates, retain the same three-forward
+  supervision, zero consistency, and class-name inference. Real-model GPU
+  smoke passed. Full training finished (best epoch 7). Standard FSC147
+  validation MAE/RMSE **23.50 / 82.80**, test **23.45 / 115.18**.
+  The best weights are `best_model_7.pth` under
+  `checkpoints/rich_prompt/rp009/template_diversity_1000x10_v1/`
+  in the existing T2ICount-assets Drive root. The source commit was
+  `d9601df91bfefa58f823eaf021cca617b6394ac7`.
+- Standard FSC147 test comparison, class-name inference:
+  BASE-002 **22.82 / 120.25**;
+  RP-003 **19.98 / 107.13**;
+  RP-009 **23.45 / 115.18** (MAE / RMSE).
+
+**Accepted interpretation:** generic template diversity in this run did not
+reproduce RP-003's recorded class-name counting improvement. Versus BASE-002,
+RP-009 has slightly worse MAE and better RMSE. This does not establish that
+rich semantics caused RP-003's improvement; historical RP-003 runtime,
+initialization, and artifact provenance remain incomplete, and the comparison
+is across single runs. RP-008 is preflight-only and does not close that
+attribution gap.
+
+**Decision:** RP-009 is CLOSED / INFORMATIVE. Avoid repeating the same generic
+template run without a new hypothesis. The next step is to plan a focused,
+low-cost diagnostic or provenance-matched comparison, explicitly reviewed
+before new training; no RP-010 or ALIGN-005 experiment has been executed or
+approved.
+
 ## Exact current stopping point
 
 ```text
-direct rich prompts -> failed
-multi-prompt supervision + consistency
-  -> outputs can agree without becoming accurate
-  -> stop raw lambda_cons tuning
-RichCount-inspired Stage-1 investigation
-  -> raw smoke/debug
-  -> normalization, margin, and initialization diagnostics
-  -> frozen CLIP has strong global rich-text alignment
-  -> ALIGN-003 minimal FFN, 5 epochs
-  -> ALIGN-004 Figure3+BN FFN, 5 epochs
-CURRENT STOP: ALIGN-004 finished
+RP-003 rich-prompt multi-supervision -> improved class-name test counting,
+    but semantic attribution unresolved
+RP-008 repeat-class matched control -> GPU preflight REVIEW only; full run forgone
+RP-009 generic template control -> 10 epochs complete; class-name results
+    worse than RP-003, mixed versus BASE-002
+ALIGN-004 -> current best RichCount-inspired Stage-A candidate; counting untested
+CURRENT STOP: Review next diagnostic; no new training authorized
 ```
 
 Not yet done:
 
+- no full repeat-class RP-008 control exists;
+- no repeated-seed/provenance-matched causal comparison establishes the source
+  of RP-003's gain;
 - no paper-like Stage-B Adapter has been trained from ALIGN-004;
 - no downstream T2ICount counting experiment has used ALIGN-004;
 - no decisive diagnostic has localized failure to U-Net attention, HSCM, or
@@ -418,10 +457,6 @@ Not yet done:
 - DUMLO remains parked.
 
 No proposed future experiment is a completed result.
-
-ALIGN-004 remains the latest completed alignment experiment. ALIGN-005 remains
-proposed but not executed and is not scientifically approved. The reviewed
-objective update does not authorize ALIGN-005 or any other new experiment.
 
 ## Do not repeat without a new hypothesis
 
