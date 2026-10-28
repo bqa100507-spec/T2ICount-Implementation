@@ -1,0 +1,108 @@
+{
+  "seed": 3407,
+  "rule": "Sort image IDs lexicographically. Bin GT counts: [0,1], [2,5], [6,20], [21,+inf). Use random.Random(3407) to shuffle each bin once in bin order. Round-robin over nonempty bins; within each bin prefer the remaining image whose class has been selected least often globally, breaking ties by shuffled order. No predictions used.",
+  "metadata_sha256": "7040090d0d4c8805646a7e392dc23b7b7c87ffdc4b03019d06f3aeaa3130a51e",
+  "bank_sha256": "1c0c87ff686618bcb008b5fc077e994b3144ac3bb71c448411a00a261bfcc89c",
+  "images": [
+    {
+      "image": "3319.jpg",
+      "class": "scissors",
+      "gt_count": 1.0
+    },
+    {
+      "image": "7706.jpg",
+      "class": "people",
+      "gt_count": 2.0
+    },
+    {
+      "image": "918.jpg",
+      "class": "shirts",
+      "gt_count": 16.0
+    },
+    {
+      "image": "31.jpg",
+      "class": "lemons",
+      "gt_count": 37.0
+    },
+    {
+      "image": "605.jpg",
+      "class": "light house",
+      "gt_count": 1.0
+    },
+    {
+      "image": "290.jpg",
+      "class": "flowers",
+      "gt_count": 2.0
+    },
+    {
+      "image": "343.jpg",
+      "class": "kiwis",
+      "gt_count": 13.0
+    },
+    {
+      "image": "336.jpg",
+      "class": "blueberries",
+      "gt_count": 117.0
+    },
+    {
+      "image": "6305.jpg",
+      "class": "bottles",
+      "gt_count": 1.0
+    },
+    {
+      "image": "3169.jpg",
+      "class": "bananas",
+      "gt_count": 4.0
+    },
+    {
+      "image": "6353.jpg",
+      "class": "books",
+      "gt_count": 12.0
+    },
+    {
+      "image": "3721.jpg",
+      "class": "m&m pieces",
+      "gt_count": 43.0
+    },
+    {
+      "image": "3699.jpg",
+      "class": "cups",
+      "gt_count": 1.0
+    },
+    {
+      "image": "3019.jpg",
+      "class": "tables",
+      "gt_count": 2.0
+    },
+    {
+      "image": "5651.jpg",
+      "class": "sticks",
+      "gt_count": 9.0
+    },
+    {
+      "image": "63.jpg",
+      "class": "polka dots",
+      "gt_count": 23.0
+    },
+    {
+      "image": "3287.jpg",
+      "class": "spoons",
+      "gt_count": 1.0
+    },
+    {
+      "image": "75.jpg",
+      "class": "cans",
+      "gt_count": 4.0
+    },
+    {
+      "image": "3703.jpg",
+      "class": "tomatoes",
+      "gt_count": 6.0
+    },
+    {
+      "image": "5356.jpg",
+      "class": "mosaic tiles",
+      "gt_count": 24.0
+    }
+  ]
+}

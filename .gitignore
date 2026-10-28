@@ -28,6 +28,21 @@ venv/
 /data/
 /src/
 
+# External dataset payloads (keep the datasets/ Python package versioned)
+/datasets/FSC147/
+/datasets/CARPK/
+/datasets/IDCIA/
+
+# Saved/generated prompt banks are external runtime assets
+/prompts/*.json
+
+# Spatial diagnostic tensors, archives and private scratch storage
+*.npz
+*.npy
+*.tar
+*.zip
+/.spatial_diagnostic_tmp/
+
 # Generated training/evaluation artifacts
 /outputs/
 /results/
