@@ -433,6 +433,16 @@ low-cost diagnostic or provenance-matched comparison, explicitly reviewed
 before new training; no RP-010 or ALIGN-005 experiment has been executed or
 approved.
 
+## RP-010 / RP-011 / RP-012 update (2026-11-26)
+
+- RP-010 (A template vs B rich, seed 3407, 10 epochs): B lower error on every
+  reported metric (FSC147 test MAE 22.304 vs 25.364; FSC-147-S MAE 24.973 vs
+  28.198). Single seed; descriptive only. See EXPERIMENT_LEDGER.md.
+- RP-011 (HNW vs control, 2 epochs from RP-010B): decision rule not met; both
+  arms' RMSE worse than the 81.675 starting point. Negative/inconclusive.
+- RP-012 (official-checkpoint warm start): prepared only, `RUN_TRAINING=False`.
+  Not run; needs an explicit owner decision.
+
 ## Exact current stopping point
 
 ```text

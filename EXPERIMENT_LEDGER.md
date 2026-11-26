@@ -1540,3 +1540,60 @@ own approved specification.
 ### Status
 
 CLOSED / INFORMATIVE
+
+---
+
+## RP-010 — Controlled rich vs template supervision (A/B)
+
+### Setup
+Seed 3407, 1000 anchors, 10 epochs; both arms selected epoch 9. Hardware: NVIDIA L4. Source commit `9f673ce`.
+Arm A = template prompts; Arm B = rich prompts. Same pipeline otherwise.
+Artifacts: `outputs/.../pair_v1/...` on Drive. B weights `best_epoch9.pth`, SHA-256 `a85c92790e29fe6c1a2c5f0232e7ccacaf205d4cc0e49eaaa6fc7400d6026513`.
+
+### Results
+
+| Arm | Val MAE/RMSE | FSC147 test MAE/RMSE/bias | FSC-147-S MAE/RMSE |
+|---|---|---|---|
+| A (template) | 25.500 / 84.041 | 25.364 / 122.197 / +10.53 | 28.198 / 53.211 |
+| B (rich) | 22.983 / 81.675 | 22.304 / 118.766 / +8.20 | 24.973 / 41.135 |
+
+B is better than A on every reported metric (test MAE −3.06, RMSE −3.43; FSC-147-S MAE −3.23, RMSE −12.08).
+
+### What this proves / does NOT prove
+Within this single-seed controlled pair, rich-prompt supervision scored lower error than template supervision. It does **not** establish significance or causality: one seed, one run per arm, 10 epochs, small training subset. Differences are descriptive.
+
+### Decision
+Owner approved recording as stated on 2026-11-26 (single-seed, descriptive only).
+
+### Status
+CLOSED / INFORMATIVE
+
+---
+
+## RP-011 — HNW (hard-negative weighting) vs control
+
+### Setup
+Warm start from RP-010B epoch 9, 2 epochs, n=1286. HNW weight `w = 1 + ReLU(s)`. Control uses the same schedule without HNW.
+
+### Results (val MAE / RMSE)
+
+| Arm | Epoch 0 | Epoch 1 | Best |
+|---|---|---|---|
+| control | 21.964 / 89.421 | 22.448 / 92.390 | ep0 |
+| HNW | 23.227 / 95.105 | 22.178 / 89.159 | ep1 |
+
+Starting point (RP-010B val): 22.983 / 81.675.
+
+### What this proves / does NOT prove
+The pre-registered decision rule was **not met**. Both arms have RMSE worse than the starting point's 81.675, so neither shows a validated improvement from continued training. Control's best MAE (21.964, ep0) is lower than HNW's best (22.178, ep1), while HNW's best RMSE (89.159) is lower than control's best (89.421): a mixed picture. No claim that HNW helps or hurts can be made from two epochs and one seed.
+
+### Decision
+Owner approved recording as negative/inconclusive on 2026-11-26. Do not run RP-012 without an explicit owner decision.
+
+### Status
+CLOSED / NEGATIVE-INCONCLUSIVE
+
+---
+
+## RP-012 — prepared only
+Official `best_model_paper.pth` (SHA `ce47c776…bca8c`), one-epoch warm start; val must be within 10% of published 13.78 / 58.78. `RUN_TRAINING=False`. **Not run.**
