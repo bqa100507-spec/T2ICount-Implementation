@@ -1,0 +1,11 @@
+{
+  "schema": "rp011-hnw-v1",
+  "base_config": "configs/rp010b.json",
+  "epochs": 2,
+  "start_val": 0,
+  "val_epoch": 1,
+  "sampling_epoch_start": 0,
+  "source_epoch": 9,
+  "checkpoint": "best_epoch9.pth",
+  "checkpoint_sha256": "sha256:a85c92790e29fe6c1a2c5f0232e7ccacaf205d4cc0e49eaaa6fc7400d6026513"
+}

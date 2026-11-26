@@ -62,6 +62,12 @@ def parse_arg(argv=None):
                         help='weight for symmetric rich-prompt density consistency')
     parser.add_argument('--rich-loss-diagnostic-steps', default=0, type=int,
                         help='log raw rich loss scales for the first N train steps')
+    hnw = parser.add_mutually_exclusive_group()
+    hnw.add_argument('--rrcl-hnw', dest='rrcl_hnw', action='store_true',
+                     help='weight RRCL negatives by detached positive similarity')
+    hnw.add_argument('--no-rrcl-hnw', dest='rrcl_hnw', action='store_false',
+                     help='use the original T2ICount RRCL negative reduction (default)')
+    parser.set_defaults(rrcl_hnw=False)
     parser.add_argument('--stride', default=384, type=int,
                         help='the stride for patchify')
     parser.add_argument('--beta', default=1e-4, type=float,

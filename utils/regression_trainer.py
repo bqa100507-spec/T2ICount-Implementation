@@ -291,7 +291,7 @@ def log_rich_loss_diagnostic(
     return combined_loss
 
 
-def _t2i_loss_components(outputs, gt_den_maps, gt_img_attn_mask):
+def _t2i_loss_components(outputs, gt_den_maps, gt_img_attn_mask, rrcl_hnw=False):
     pred_den, sim_x2, sim_x1, fused_cross_attn = outputs
     ambiguous_negative = (
         fused_cross_attn * gt_img_attn_mask
@@ -300,8 +300,8 @@ def _t2i_loss_components(outputs, gt_den_maps, gt_img_attn_mask):
     reg_loss = get_reg_loss(
         pred_den, gt_den_maps, threshold=1e-3 * 60
     )
-    rrc_loss_stage1 = RRC_loss(sim_x2, ambiguous_negative, positive)
-    rrc_loss_stage2 = RRC_loss(sim_x1, ambiguous_negative, positive)
+    rrc_loss_stage1 = RRC_loss(sim_x2, ambiguous_negative, positive, hnw=rrcl_hnw)
+    rrc_loss_stage2 = RRC_loss(sim_x1, ambiguous_negative, positive, hnw=rrcl_hnw)
     return {
         'reg': reg_loss,
         'rrc1': rrc_loss_stage1,
@@ -430,6 +430,11 @@ class Reg_Trainer(Trainer):
 
     def _load_training_checkpoint(self, path):
         checkpoint = load_trusted_legacy_checkpoint(path, 'cpu')
+        # Legacy checkpoints predate HNW and therefore use the original loss.
+        if checkpoint.get('rrcl_hnw', False) != getattr(
+            getattr(self, 'args', None), 'rrcl_hnw', False
+        ):
+            raise ValueError('RRCL HNW configuration mismatch on resume.')
         validate_resume_rich_config(
             getattr(self, 'rich_prompt_config', None),
             checkpoint.get('rich_prompt_config'),
@@ -461,6 +466,7 @@ class Reg_Trainer(Trainer):
             'best_mae': self.best_mae,
             'best_mse': self.best_mse,
             'rng_state': _capture_rng_state(),
+            'rrcl_hnw': getattr(getattr(self, 'args', None), 'rrcl_hnw', False),
         }
         if getattr(self, 'rich_prompt_config', None) is not None:
             payload['rich_prompt_config'] = dict(self.rich_prompt_config)
@@ -481,6 +487,7 @@ class Reg_Trainer(Trainer):
 
     def train_epoch(self):
         args = self.args
+        loss_options = {'rrcl_hnw': True} if getattr(args, 'rrcl_hnw', False) else {}
         epoch_reg_loss = AverageMeter()
         epoch_RRC1_loss = AverageMeter()
         epoch_RRC2_loss = AverageMeter()
@@ -521,7 +528,7 @@ class Reg_Trainer(Trainer):
                 )
                 pred_den = class_outputs[0]
                 class_components = _t2i_loss_components(
-                    class_outputs, gt_den_maps, gt_img_attn_mask
+                    class_outputs, gt_den_maps, gt_img_attn_mask, **loss_options
                 )
                 reg_loss = class_components['reg']
                 rrc_loss_stage1 = class_components['rrc1']
@@ -563,6 +570,7 @@ class Reg_Trainer(Trainer):
                             class_rich_outputs,
                             rich_gt_den_maps,
                             rich_img_attn_mask,
+                            **loss_options,
                         )
                         class_rich_loss = class_rich_components['total']
 
@@ -605,11 +613,13 @@ class Reg_Trainer(Trainer):
                             detailed_outputs,
                             rich_gt_den_maps,
                             rich_img_attn_mask,
+                            **loss_options,
                         )
                         generalized_components = _t2i_loss_components(
                             generalized_outputs,
                             rich_gt_den_maps,
                             rich_img_attn_mask,
+                            **loss_options,
                         )
                         detailed_loss = detailed_components['total']
                         generalized_loss = generalized_components['total']
@@ -794,11 +804,19 @@ def get_reg_loss(pred, gt, threshold, level=3, window_size=3):
     return loss_ssim + 0.1 * tv_loss
 
 
-def RRC_loss(simi, ambiguous_negative_map, positive_map):
+def RRC_loss(simi, ambiguous_negative_map, positive_map, hnw=False):
+    """Original RRCL, optionally reweighting only selected negatives."""
     pos = (1 - simi) * positive_map
-    neg = torch.clamp(simi, min=0) * (ambiguous_negative_map == 0) * (positive_map == 0)
-
     pos_num = positive_map.flatten(1).sum(dim=1)
-    neg_num = ((ambiguous_negative_map == 0) * (positive_map == 0)).flatten(1).sum(dim=1)
+    if hnw:
+        # Keep both the weights and their normalization outside autograd.
+        # Accumulate the weighted reduction in FP32 for low-precision inputs.
+        negative_simi = simi.float() if simi.dtype in (torch.float16, torch.bfloat16) else simi
+        weights = 1 + F.relu(negative_simi).detach()
+        neg = torch.clamp(negative_simi, min=0) * (ambiguous_negative_map == 0) * (positive_map == 0) * weights
+        neg_num = (weights * (ambiguous_negative_map == 0) * (positive_map == 0)).flatten(1).sum(dim=1)
+    else:
+        neg = torch.clamp(simi, min=0) * (ambiguous_negative_map == 0) * (positive_map == 0)
+        neg_num = ((ambiguous_negative_map == 0) * (positive_map == 0)).flatten(1).sum(dim=1)
     loss = 2 * pos.flatten(1).sum(dim=1) / (pos_num + 1e-7) + neg.flatten(1).sum(dim=1) / (neg_num + 1e-7)
     return loss.mean()

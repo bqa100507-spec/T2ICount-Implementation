@@ -1,0 +1,15 @@
+{
+  "official_checkpoint_sha256": "sha256:ce47c776ba5edf43ccf22ef332a08d80c9db713cc5a01f51d64b8d729fcbca8c",
+  "rp010b_config_digest": "sha256:9c5c0121e5c299108957feb9be84529032bb63ba21b5f329b1535b7f83e3a9e7",
+  "published_validation": {"mae": 13.78, "rmse": 58.78},
+  "baseline_relative_tolerance": 0.1,
+  "rp010b_data": {
+    "selected_image_fingerprint": "sha256:dd96b36bf15013e194b1a8ece06452a19822aae028fc00c0de019cbb7a311f24",
+    "prompt_bank_sha256": "sha256:c3ec587b37fd9f351cdedbce888b26e0ba7a020de956c4ef18202a1268e7e32f",
+    "split_sha256": "sha256:e281e2d9118cd9ae6f5a2852006b6a24e7a7ea5605d9a6e0fa946dcf93308271",
+    "class_sha256": "sha256:ba1bc6c6a21875919625adb851eaee1aab0ad1f88ecf64d017bebda891b5815e",
+    "annotations_sha256": "sha256:6a1d0f43d12274219a5307cb35b24c85fb275a34b3d5acf5b67f2066f9e0bfe1",
+    "split_counts": {"train": 3659, "val": 1286, "test": 1190},
+    "donor_pool_size": 3659
+  }
+}
